@@ -1,373 +1,316 @@
-const express = require('express');
-const bodyParser = require('body-parser');
-const { MongoClient } = require('mongodb');
-const dotenv = require('dotenv');
-const axios = require('axios');
-const Twilio = require('twilio');
-const cors = require('cors');
+/* eslint-disable no-console */
+require("dotenv").config();
 
-dotenv.config();
+const express = require("express");
+const cors = require("cors");
+const axios = require("axios");
+const { MongoClient } = require("mongodb");
+const notificationapi = require("notificationapi-node-server-sdk").default;
 
 const app = express();
 app.use(cors());
-app.use(bodyParser.urlencoded({ extended: false }));
-app.use(bodyParser.json());
+app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
 
-const uri = `mongodb+srv://${process.env.MONGODB_USER}:${process.env.MONGODB_PASSWORD}@bedrockdev.j1dmahl.mongodb.net/test`;
-const clientDB = new MongoClient(uri, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true,
-});
+// ----------------- Config -----------------
+const PORT = Number(process.env.PORT || 3001);
 
-let faqCollection;
-let flaggedKeywordCollection;
-let parametersCollection;
-let ticketsCollection;
-let archivesCollection;
-let activePhoneNumbers = [];
-let viewingConversations = [];
-let rolesCollection;
+const NOTIF_CLIENT_ID = process.env.NOTIF_CLIENT_ID;
+const NOTIF_CLIENT_SECRET = process.env.NOTIF_CLIENT_SECRET;
+const NOTIF_BASE_URL = process.env.NOTIF_BASE_URL; // optional
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL; // not required for sending, but ok to keep
+const NOTIF_INBOUND_WEBHOOK_SECRET = process.env.NOTIF_INBOUND_WEBHOOK_SECRET;
 
-async function connectToDB() {
-    try {
-        await clientDB.connect();
-        const db = clientDB.db("HRMAI");
-        faqCollection = db.collection("Knowledge_Base");
-        flaggedKeywordCollection = db.collection("Flaged_Keywords");
-        parametersCollection = db.collection("Parameters");
-        ticketsCollection = db.collection("Front_End_Tickets");
-        archivesCollection = db.collection("Front_End_Archives");
-        rolesCollection = db.collection("User_Roles");
-        await faqCollection.createIndex({ keywords: 'text', question: 'text', answer: 'text' });
-        await parametersCollection.createIndex({ keywords: 'text', question: 'text', answer: 'text' });
-    } catch (error) {
-        console.error('Failed to connect to the database', error);
-        throw error;
-    }
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+const MONGODB_URI = process.env.MONGODB_URI;
+const MONGODB_DB = process.env.MONGODB_DB || "llrchatbot";
+
+if (!NOTIF_CLIENT_ID || !NOTIF_CLIENT_SECRET) throw new Error("Missing NOTIF_CLIENT_ID / NOTIF_CLIENT_SECRET");
+if (!NOTIF_INBOUND_WEBHOOK_SECRET) throw new Error("Missing NOTIF_INBOUND_WEBHOOK_SECRET");
+if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
+if (!MONGODB_URI) throw new Error("Missing MONGODB_URI");
+
+// Init NotificationAPI AFTER env is validated
+const initConfig = NOTIF_BASE_URL ? { baseURL: NOTIF_BASE_URL } : undefined;
+notificationapi.init(NOTIF_CLIENT_ID, NOTIF_CLIENT_SECRET, initConfig);
+
+// ----------------- Mongo -----------------
+const mongo = new MongoClient(MONGODB_URI);
+let sessions;
+let webhookEvents;
+
+async function initDb() {
+  await mongo.connect();
+  const db = mongo.db(MONGODB_DB);
+
+  sessions = db.collection("SMS_AI_Sessions");
+  webhookEvents = db.collection("Webhook_Events");
+
+  await sessions.createIndex({ userId: 1 }, { unique: true });
+  await sessions.createIndex({ updatedAt: -1 });
+
+  // Dedupe key: lastTrackingId per inbound event
+  await webhookEvents.createIndex({ trackingId: 1 }, { unique: true });
+  // Optional TTL to auto-clean dedupe records (7 days)
+  await webhookEvents.createIndex({ createdAt: 1 }, { expireAfterSeconds: 7 * 24 * 3600 });
+
+  console.log("✅ Mongo connected");
 }
 
-connectToDB().catch(console.error);
-
-const accountSid = process.env.TWILIO_ACCOUNT_SID;
-const authToken = process.env.TWILIO_AUTH_TOKEN;
-const twilioNumber = '+19512618044';
-const twilioClient = new Twilio(accountSid, authToken);
-const openaiApiKey = process.env.OPENAI_API_KEY;
-
-function truncateAtSentence(text, maxLength) {
-    if (text.length <= maxLength) return text;
-
-    const sentenceEnd = /[\.\?\!](\s|$)/g;
-    let lastValidIndex = -1;
-    let match;
-
-    while ((match = sentenceEnd.exec(text)) !== null) {
-        if (match.index + 1 <= maxLength) {
-            lastValidIndex = match.index + 1;
-        } else {
-            break;
-        }
-    }
-
-    if (lastValidIndex === -1) {
-        const lastSpaceIndex = text.lastIndexOf(' ', maxLength);
-        if (lastSpaceIndex > 0) {
-            lastValidIndex = lastSpaceIndex;
-        } else {
-            lastValidIndex = maxLength;
-        }
-    }
-
-    return text.substring(0, lastValidIndex).trim();
+// ----------------- Helpers -----------------
+function isEmojiOnly(text) {
+  const t = String(text || "").trim();
+  if (!t) return true;
+  const stripped = t
+    .replace(/[\u{1F300}-\u{1FAFF}]/gu, "")
+    .replace(/[\u{2600}-\u{27BF}]/gu, "")
+    .replace(/\s/g, "");
+  return stripped.length === 0;
 }
 
-function normalizePhoneNumber(phoneNumber) {
-    return phoneNumber.replace(/\D/g, '');
+function normalizeUserIdFromPhone(phoneE164) {
+  return String(phoneE164 || "").replace(/\D/g, "");
 }
 
-app.get('/serviceStatus', (req, res) => {
-    const { phoneNumber } = req.query;
-    if (phoneNumber) {
-        const normalizedPhoneNumber = normalizePhoneNumber(phoneNumber);
-        const isActive = activePhoneNumbers.includes(normalizedPhoneNumber);
-        console.log(`Checking status for ${normalizedPhoneNumber}: ${isActive}`);
-        res.json({ isActive });
-    } else {
-        res.status(400).json({ error: 'Phone number is required' });
-    }
-});
-
-app.post('/toggleService', (req, res) => {
-    const { phoneNumber, isActive } = req.body;
-
-    if (phoneNumber && typeof isActive === 'boolean') {
-        const normalizedPhoneNumber = normalizePhoneNumber(phoneNumber);
-        console.log(`Received request to set status for ${normalizedPhoneNumber} to ${isActive}`);
-
-        if (isActive) {
-            if (!activePhoneNumbers.includes(normalizedPhoneNumber)) {
-                activePhoneNumbers.push(normalizedPhoneNumber);
-                console.log(`Added ${normalizedPhoneNumber} to activePhoneNumbers`);
-            } else {
-                console.log(`${normalizedPhoneNumber} is already in the activePhoneNumbers list`);
-            }
-        } else {
-            if (activePhoneNumbers.includes(normalizedPhoneNumber)) {
-                activePhoneNumbers = activePhoneNumbers.filter(num => num !== normalizedPhoneNumber);
-                console.log(`Removed ${normalizedPhoneNumber} from activePhoneNumbers`);
-            } else {
-                console.log(`${normalizedPhoneNumber} is not in the activePhoneNumbers list`);
-            }
-        }
-
-        console.log('Updated active phone numbers:', JSON.stringify(activePhoneNumbers));
-        res.status(200).json({ message: `Service for ${normalizedPhoneNumber} is now ${isActive}` });
-    } else {
-        res.status(400).json({ error: 'Invalid value. Please provide a phone number and a boolean value for isActive.' });
-    }
-});
-
-app.post('/updateViewingStatus', (req, res) => {
-    const { conversationSid, isViewing } = req.body;
-
-    if (conversationSid) {
-        if (isViewing) {
-            if (!viewingConversations.includes(conversationSid)) {
-                viewingConversations.push(conversationSid);
-            }
-        } else {
-            viewingConversations = viewingConversations.filter(sid => sid !== conversationSid);
-        }
-
-        console.log('Updated viewing conversations list:', JSON.stringify(viewingConversations));
-        res.status(200).json({ message: 'Viewing status updated successfully' });
-    } else {
-        res.status(400).json({ error: 'Invalid value. Please provide a conversationSid.' });
-    }
-});
-
-app.get('/viewingStatus', (req, res) => {
-    res.json({ viewingConversations });
-});
-
-app.post('/sms', async (req, res) => {
-    const incomingMsg = req.body.Body;
-    const fromNumber = req.body.From;
-
-    const normalizedFromNumber = normalizePhoneNumber(fromNumber);
-
-    console.log(`Received message from ${fromNumber}: ${incomingMsg}`);
-
-    // You can handle SMS responses here
-
-    console.log(`Message sent to ${fromNumber}`);
-    res.type('text/xml').send('<Response></Response>');
-});
-
-async function participantExists(conversationSid, identity) {
-    try {
-        let participants = await twilioClient.conversations.v1.conversations(conversationSid).participants.list();
-        return participants.some(participant => participant.identity === identity);
-    } catch (error) {
-        console.error(`Error checking participant existence: ${error.message}`);
-        throw error;
-    }
+function assertE164(number) {
+  if (!/^\+[1-9]\d{1,14}$/.test(number)) {
+    throw new Error(`Phone must be E.164 like +16175551212. Got: ${number}`);
+  }
 }
 
-app.post('/updateConversationName', async (req, res) => {
-    const { conversationSid, chatName } = req.body;
+function takeLastMessages(history = [], max = 12) {
+  if (!Array.isArray(history)) return [];
+  return history.slice(Math.max(0, history.length - max));
+}
 
-    if (!conversationSid || !chatName) {
-      return res.status(400).json({ error: 'Invalid value. Please provide a conversationSid and a chatName.' });
+async function openaiReply({ userText, history }) {
+  const system = `
+You are an AI SMS assistant. Be concise, helpful, and human.
+Rules:
+- Keep replies under ~320 characters unless absolutely necessary.
+- No markdown, no bullet spam.
+- If user asks multiple questions, answer in 1-2 tight sentences.
+- If they ask for sensitive personal data, refuse.
+`;
+
+  const messages = [
+    { role: "system", content: system.trim() },
+    ...takeLastMessages(history, 12),
+    { role: "user", content: userText },
+  ];
+
+  const resp = await axios.post(
+    "https://api.openai.com/v1/chat/completions",
+    {
+      model: OPENAI_MODEL,
+      messages,
+      temperature: 0.4,
+      max_tokens: 140,
+    },
+    {
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+      timeout: 60000,
+    }
+  );
+
+  return resp.data?.choices?.[0]?.message?.content?.trim() || "";
+}
+
+// ----------------- OUTBOUND-FIRST -----------------
+app.post("/outbound/start", async (req, res) => {
+  try {
+    const { number, firstMessage, userId } = req.body || {};
+    if (!number || !firstMessage) {
+      return res.status(400).json({ error: "number and firstMessage are required" });
     }
 
-    try {
-      const conversation = await twilioClient.conversations.v1.conversations(conversationSid).fetch();
-      await conversation.update({ uniqueName: chatName });
-      console.log("updated chatName successfully")
-      res.status(200).json({ message: 'Conversation chat name updated successfully' });
-    } catch (error) {
-      console.error('Failed to update conversation chat name', error);
-      res.status(500).json({ error: 'Failed to update conversation chat name' });
-    }
+    assertE164(number);
+    const uid = userId || normalizeUserIdFromPhone(number);
+
+    // Create / update session doc
+    await sessions.updateOne(
+      { userId: uid },
+      {
+        $setOnInsert: {
+          userId: uid,
+          createdAt: new Date(),
+        },
+        $set: { number, updatedAt: new Date() },
+        $push: {
+          history: {
+            $each: [{ role: "assistant", content: String(firstMessage) }],
+            $slice: -30,
+          },
+        },
+      },
+      { upsert: true }
+    );
+
+    // Send outbound SMS (NO webhookUrl here; webhooks are configured in dashboard)
+    await notificationapi.send({
+      type: "ai_sms_chat",
+      to: { id: uid, number },
+      sms: { message: String(firstMessage) },
+    });
+
+    return res.json({ ok: true, userId: uid, number });
+  } catch (err) {
+    console.error("outbound/start error:", err?.response?.data || err?.message || err);
+    return res.status(500).json({ error: err?.message || "failed" });
+  }
 });
 
+// ----------------- INBOUND WEBHOOK -----------------
+app.post("/webhook/notificationapi/sms", async (req, res) => {
+  const debug = req.query.debug === "1";
 
+  try {
+    // Don’t log tokens or full URLs
+    console.log("📩 webhook HIT", {
+      eventType: req.body?.eventType,
+      userId: req.body?.userId,
+      from: req.body?.from,
+      hasText: Boolean(req.body?.text),
+      lastTrackingId: req.body?.lastTrackingId,
+    });
 
-app.post('/webhook', async (req, res) => {
-    let eventType = req.body.EventType;
-    let conversationSid = req.body.ConversationSid;
-    let participantSid = req.body.ParticipantSid;
-    try {
+    // Basic auth via query param secret (simple)
+    if (req.query.token !== NOTIF_INBOUND_WEBHOOK_SECRET) {
+      return res.status(401).send("unauthorized");
+    }
 
-        const roleEmails = await rolesCollection.find({}, { projection: { email: 1, _id: 0 } }).toArray();
-        const emails = roleEmails.map(doc => doc.email);
-        const emailSet = new Set(emails);
+    const payload = req.body || {};
 
-        if (eventType === 'onParticipantAdded') {
-            let phoneNumber = req.body["MessagingBinding.Address"];
-            await twilioClient.conversations.v1.conversations(conversationSid)
-                .update({ friendlyName: phoneNumber });
+    // Ignore delivery receipts etc.
+    if (payload.eventType !== "SMS_INBOUND") {
+      return res.status(200).json({ ok: true, ignored: payload.eventType || true });
+    }
 
+    const { from, text, lastTrackingId } = payload;
+    let { userId } = payload;
 
-            if (!(await participantExists(conversationSid, phoneNumber))) {
-                await twilioClient.conversations.v1.conversations(conversationSid)
-                    .participants
-                    .create({ identity: phoneNumber, attributes: JSON.stringify({ name: phoneNumber }) });
-            }
-            if (!(await participantExists(conversationSid, twilioNumber))) {
-                await twilioClient.conversations.v1.conversations(conversationSid)
-                    .participants
-                    .create({ identity: twilioNumber, attributes: JSON.stringify({ name: twilioNumber }) });
-            }
+    if (!userId && from) userId = normalizeUserIdFromPhone(from);
 
-            for (const email of emails) {
-                if (!(await participantExists(conversationSid, email))) {
-                    await twilioClient.conversations.v1.conversations(conversationSid)
-                        .participants
-                        .create({ identity: email, attributes: JSON.stringify({ name: email }) });
-                }
-            }
+    if (!from || typeof text !== "string" || !userId) {
+      return res.status(200).json({ ok: true, ignored: "missing_fields" });
+    }
 
-        } else if (eventType === 'onMessageAdded') {
-            let phoneNumber = req.body.Author;
-            let incomingMsg = req.body.Body;
-            const normalizedFromNumber = normalizePhoneNumber(phoneNumber);
-            const conversation = await twilioClient.conversations.v1.conversations(conversationSid).fetch();
-
-            const flaggedKeywords = await flaggedKeywordCollection.find().toArray();
-            const keywordList = flaggedKeywords.map(keyword => keyword.question.toLowerCase());
-
-            const prompt = `
-            The following is a list of flagged keywords:
-            ${keywordList.join(", ")}
-
-            Determine stricktly if the following message contains a flagged keyword and requires human assistance:
-            "${incomingMsg}"
-            Respond with "yes" if it requires human help and "no" if it doesn't.
-            `;
-
-            const response = await axios.post("https://api.openai.com/v1/chat/completions", {
-                model: "gpt-3.5-turbo",
-                            messages: [
-                                { role: "system", content: prompt },
-                                { role: "system", content: incomingMsg },
-                                { role: "user", content: incomingMsg }
-                            ],
-                            temperature: 0.5,
-                            max_tokens: 10
-            }, {
-                headers: { "Authorization": `Bearer ${openaiApiKey}`, "Content-Type": "application/json" },
-                timeout: 60000
-            });
-
-            const needsHumanHelp = response.data.choices[0].message.content.toLowerCase() === 'yes';
-
-            if (needsHumanHelp) {
-                const existingTicket = await ticketsCollection.findOne({ conversationSID: conversationSid });
-                if (!existingTicket) {
-                    await ticketsCollection.insertOne({ conversationSID: conversationSid });
-                    console.log(`Flagged keyword found. Added conversationSID ${conversationSid} to tickets collection.`);
-                } else {
-                    console.log(`ConversationSID ${conversationSid} already exists in the tickets collection.`);
-                }
-            }
-
-            if (emailSet.has(phoneNumber)) {
-                console.log("Message from web, no reply will be sent.");
-            } else if (!activePhoneNumbers.includes(normalizedFromNumber)) {
-                try {
-                    const [faqs, parameters] = await Promise.all([
-                        faqCollection.find({ $text: { $search: incomingMsg } }).toArray(),
-                        parametersCollection.find({ $text: { $search: incomingMsg } }).toArray()
-                    ]);
-                    let replyText = "";
-
-                    if (faqs.length > 0) {
-                        let relevantFaqs = faqs.filter(faq => faq.score >= 0.5);
-                        if (relevantFaqs.length > 0) {
-                            replyText = relevantFaqs[0].answer;
-                        }
-                    }
-
-                    if (!replyText && parameters.length > 0) {
-                        let relevantParams = parameters.filter(param => param.score >= 0.5);
-                        if (relevantParams.length > 0) {
-                            replyText = relevantParams[0].answer;
-                        }
-                    }
-
-                    if (!replyText) {
-                            const allFaqContext = faqs.map(faq => ` ${faq.question} : ${faq.answer}`).join('\n');
-                            const allParamContext = parameters.map(param => `${param.question}`).join('\n');
-                            const response = await axios.post("https://api.openai.com/v1/chat/completions", {
-                                model: "gpt-3.5-turbo",
-                                messages: [
-                                    { role: "system", content: `Provide a clear, concise, and informative response within 150 tokens and ensure the response ends at a complete sentence and use ${allFaqContext} and ${allParamContext} as context, knowledge base when reply but don't respond if the incoming message is only emoji.` },
-                                    { role: "system", content: `${allFaqContext}` },
-                                    { role: "user", content: incomingMsg }
-                                ],
-                                temperature: 0.1,
-                                max_tokens: 150
-                            }, {
-                                headers: { "Authorization": `Bearer ${openaiApiKey}`, "Content-Type": "application/json" },
-                                timeout: 60000
-                            });
-                        replyText = response.data.choices[0].message.content;
-
-                        await twilioClient.conversations.v1.conversations(conversationSid)
-                            .messages
-                            .create({ body: replyText, author: twilioNumber });
-                        console.log(replyText);
-                    }
-                } catch (error) {
-                    console.error('Failed to process request:', error);
-                    return res.status(500).send('Failed to process your message.');
-                }
-            } else {
-                console.log("Chatbot is inactive");
-            }
-
-            if (!conversation.friendlyName) {
-                await twilioClient.conversations.v1.conversations(conversationSid)
-                    .update({ friendlyName: phoneNumber });
-            }
-
-
-            if (!(await participantExists(conversationSid, phoneNumber))) {
-                await twilioClient.conversations.v1.conversations(conversationSid)
-                    .participants
-                    .create({ identity: phoneNumber, attributes: JSON.stringify({ name: phoneNumber }) });
-            }
-            if (!(await participantExists(conversationSid, twilioNumber))) {
-                await twilioClient.conversations.v1.conversations(conversationSid)
-                    .participants
-                    .create({ identity: twilioNumber, attributes: JSON.stringify({ name: twilioNumber }) });
-            }
-
-            for (const email of emails) {
-                if (!(await participantExists(conversationSid, email))) {
-                    await twilioClient.conversations.v1.conversations(conversationSid)
-                        .participants
-                        .create({ identity: email, attributes: JSON.stringify({ name: email }) });
-                }
-            }
-
-            try {
-                await archivesCollection.deleteOne({ conversationSID: conversationSid });
-            } catch (err) {
-                console.error(err);
-                return res.status(500).json({ message: 'An error occurred while restoring conversation', error: err.message });
-            }
+    // Dedupe webhook retries using lastTrackingId
+    if (lastTrackingId) {
+      try {
+        await webhookEvents.insertOne({ trackingId: lastTrackingId, createdAt: new Date() });
+      } catch (e) {
+        // Duplicate key means we already processed it
+        if (String(e?.code) === "11000") {
+          return res.status(200).json({ ok: true, deduped: true });
         }
-        return res.status(200).json({ message: `Service for webhook working` });
-    } catch (error) {
-        console.error(`Webhook error: ${error.message}`);
-        return res.sendStatus(500);
+        throw e;
+      }
     }
+
+    const upper = text.trim().toUpperCase();
+    if (["STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"].includes(upper)) {
+      return res.status(200).json({ ok: true, opted_out: true });
+    }
+
+    if (isEmojiOnly(text)) {
+      return res.status(200).json({ ok: true, emoji_only: true });
+    }
+
+    // Load session history (for conversational context)
+    const existing = await sessions.findOne({ userId });
+    const history = existing?.history || [];
+
+    // Save inbound message (cap history)
+    await sessions.updateOne(
+      { userId },
+      {
+        $setOnInsert: { userId, createdAt: new Date() },
+        $set: { number: from, updatedAt: new Date() },
+        $push: {
+          history: {
+            $each: [{ role: "user", content: text }],
+            $slice: -30,
+          },
+        },
+      },
+      { upsert: true }
+    );
+
+    // Generate AI response
+    let reply = "";
+    try {
+      reply = await openaiReply({ userText: text, history });
+    } catch (aiErr) {
+      console.error("🤖 OpenAI error:", aiErr?.response?.data || aiErr?.message || aiErr);
+      reply = "I’m having trouble replying right now. Please try again in a minute.";
+    }
+
+    reply = String(reply || "").trim();
+    if (!reply) {
+      return res.status(200).json({ ok: true, empty_reply: true });
+    }
+
+    // Send reply (NO webhookUrl)
+    try {
+      await notificationapi.send({
+        type: "ai_sms_chat",
+        to: { id: userId, number: from },
+        sms: { message: reply },
+      });
+    } catch (sendErr) {
+      console.error("📤 NotificationAPI send error:", sendErr?.response?.data || sendErr?.message || sendErr);
+      if (debug) {
+        return res.status(200).json({
+          ok: false,
+          where: "notificationapi.send",
+          error: sendErr?.message || "send failed",
+          details: sendErr?.response?.data || null,
+        });
+      }
+      return res.status(200).json({ ok: false });
+    }
+
+    // Save assistant message (cap history)
+    await sessions.updateOne(
+      { userId },
+      {
+        $set: { updatedAt: new Date() },
+        $push: {
+          history: {
+            $each: [{ role: "assistant", content: reply }],
+            $slice: -30,
+          },
+        },
+      }
+    );
+
+    return res.status(200).json({ ok: true, replyPreview: debug ? reply : undefined });
+  } catch (err) {
+    console.error("🔥 webhook fatal:", err?.response?.data || err?.message || err);
+    if (debug) {
+      return res.status(200).json({
+        ok: false,
+        where: "webhook_fatal",
+        error: err?.message || "unknown error",
+        details: err?.response?.data || null,
+      });
+    }
+    return res.status(200).json({ ok: false });
+  }
 });
 
-let PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
+// ----------------- Health -----------------
+app.get("/health", (req, res) => res.json({ ok: true }));
+
+// ----------------- Boot -----------------
+initDb()
+  .then(() => {
+    app.listen(PORT, () => console.log(`✅ Server listening on :${PORT}`));
+  })
+  .catch((e) => {
+    console.error("DB init failed:", e);
+    process.exit(1);
+  });
