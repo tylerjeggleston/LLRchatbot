@@ -58,7 +58,7 @@ let replyJobs;
 
 let escalationKeywords;
 let escalationTargets;
-let escalationEvents;
+
 let faqCollection;
 
 // NEW:
@@ -76,7 +76,7 @@ async function initDb() {
 
   escalationKeywords = db.collection("Escalation_Keywords");
   escalationTargets = db.collection("Escalation_Targets");
-  escalationEvents = db.collection("Escalation_Events");
+
   faqCollection = db.collection("FAQ_KB");
 
   outboundSettings = db.collection("Outbound_Settings");
@@ -99,11 +99,6 @@ async function initDb() {
   // escalation
   await escalationKeywords.createIndex({ keyword: 1 }, { unique: true });
   await escalationTargets.createIndex({ number: 1 }, { unique: true });
-
-  await escalationEvents.createIndex({ createdAt: -1 });
-  await escalationEvents.createIndex({ from: 1, createdAt: -1 });
-  await escalationEvents.createIndex({ matchedKeywords: 1 });
-
 
   // FAQ KB
   await faqCollection.createIndex({ enabled: 1 });
@@ -236,22 +231,11 @@ Rules:
 - If they ask for sensitive personal data, refuse.
 `;
 
-  function normalizeRole(role) {
-  if (role === "agent") return "assistant";
-  if (role === "customer") return "user";
-  if (role === "assistant" || role === "user" || role === "system" || role === "developer") return role;
-  return "assistant";
-}
-
-
   const messages = [
     { role: "system", content: system.trim() },
-    ...takeLastMessages(history, 12)
-      .filter(m => m && m.content)
-      .map(m => ({ role: normalizeRole(m.role), content: String(m.content) })),
+    ...takeLastMessages(history, 12),
     { role: "user", content: userText },
   ];
-
 
   const resp = await axios.post(
     "https://api.openai.com/v1/chat/completions",
@@ -284,54 +268,15 @@ async function getEscalationConfig() {
   return escalationCache;
 }
 
-// async function sendEscalationAlerts({ from, userId, text, matchedKeywords }) {
-//   const cfg = await getEscalationConfig();
-//   if (!matchedKeywords.length || !cfg.targets.length) return;
-
-//   const msg =
-//     `🚨 Keyword alert: ${matchedKeywords.join(", ")}\n` +
-//     `From: ${from}\n` +
-//     `UserId: ${userId}\n` +
-//     `Message: ${String(text).slice(0, 500)}`;
-
-//   await Promise.all(
-//     cfg.targets.map((targetNumber) =>
-//       notificationapi.send({
-//         type: "ai_sms_chat",
-//         to: { id: normalizeUserIdFromPhone(targetNumber), number: targetNumber },
-//         sms: { message: msg },
-//       })
-//     )
-//   );
-// }
-
-async function sendEscalationAlerts({ from, text, matchedKeywords }) {
+async function sendEscalationAlerts({ from, userId, text, matchedKeywords }) {
   const cfg = await getEscalationConfig();
   if (!matchedKeywords.length || !cfg.targets.length) return;
-
-  // Find session by digits-based userId (your standard) or by number
-  const userId = normalizeUserIdFromPhone(from);
-  const session = await sessions.findOne(
-    { userId },
-    { projection: { firstName: 1, lastName: 1, history: { $slice: -30 } } }
-  );
-
-  const firstName = String(session?.firstName || "").trim();
-  const lastName = String(session?.lastName || "").trim();
-  const fullName = `${firstName} ${lastName}`.trim() || "Unknown";
-
-  const history = session?.history || [];
-  const lastOutbound = [...history].reverse().find((m) => m?.role === "assistant" || m?.role === "agent");
-  const previousMessage = lastOutbound?.content
-  ? String(lastOutbound.content).slice(0, 500)
-  : "(no previous outbound message found)";
 
   const msg =
     `🚨 Keyword alert: ${matchedKeywords.join(", ")}\n` +
     `From: ${from}\n` +
-    `Name: ${fullName}\n` +
-    `Previous message: ${previousMessage}\n` +
-    `Reply: ${String(text).slice(0, 500)}`;
+    `UserId: ${userId}\n` +
+    `Message: ${String(text).slice(0, 500)}`;
 
   await Promise.all(
     cfg.targets.map((targetNumber) =>
@@ -343,7 +288,6 @@ async function sendEscalationAlerts({ from, text, matchedKeywords }) {
     )
   );
 }
-
 
 // ---------- FAQ helpers ----------
 async function fetchRelevantFaqs(queryText, limit = 5) {
@@ -403,12 +347,7 @@ app.post("/outbound/start", async (req, res) => {
       { userId: uid },
       {
         $setOnInsert: { userId: uid, createdAt: new Date() },
-        $set: {
-          number: normalized,
-          firstName: String(firstName || "").trim(),
-          lastName: String(lastName || "").trim(),
-          updatedAt: new Date()
-        },
+        $set: { number: normalized, updatedAt: new Date() },
         $push: {
           history: { $each: [{ role: "assistant", content: msg }], $slice: -30 },
         },
@@ -478,38 +417,9 @@ app.post("/webhook/notificationapi/sms", async (req, res) => {
     const matched = cfg.keywords.filter((k) => k && lower.includes(k));
     if (matched.length) {
       try {
-          const session = await sessions.findOne(
-    { userId },
-    { projection: { firstName: 1, lastName: 1, history: { $slice: -30 } } }
-  );
-
-  const firstName = String(session?.firstName || "").trim();
-  const lastName = String(session?.lastName || "").trim();
-
-  const history = session?.history || [];
-
-  const lastOutbound = [...history].reverse().find((m) => m?.role === "assistant" || m?.role === "agent");
-  const previousAssistantMessage = lastOutbound?.content
-    ? String(lastOutbound.content).slice(0, 500)
-    : "";
-
-
-  // optional: only log once per 30min window if you’re deduping alerts
-  await escalationEvents.insertOne({
-    createdAt: new Date(),
-    from,
-    firstName,
-    lastName,
-    matchedKeywords: matched,
-    triggerText: String(text).slice(0, 800),
-    previousAssistantMessage,
-    alertedTargets: cfg.targets || [],
-  });
-
-  // send sms alerts (your existing function)
-  await sendEscalationAlerts({ from, text, matchedKeywords: matched });
-      } catch (error) {
-        console.error("Escalation alert error:", error?.message || error);
+        await sendEscalationAlerts({ from, userId, text, matchedKeywords: matched });
+      } catch (alertErr) {
+        console.error("⚠️ escalation alert failed:", alertErr?.response?.data || alertErr?.message || alertErr);
       }
     }
 
@@ -744,26 +654,6 @@ app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
   }
 });
 
-app.get("/api/escalation/events", async (req, res) => {
-  const limit = Math.min(Number(req.query.limit || 200), 500);
-
-  const phone = String(req.query.phone || "").trim();
-  const keyword = String(req.query.keyword || "").trim().toLowerCase();
-
-  const q = {};
-  if (phone) q.from = phone;
-  if (keyword) q.matchedKeywords = keyword;
-
-  const items = await escalationEvents
-    .find(q)
-    .sort({ createdAt: -1 })
-    .limit(limit)
-    .toArray();
-
-  res.json({ items });
-});
-
-
 // Batch progress
 app.get("/api/outbound/batch/:batchId", requireAdmin, async (req, res) => {
   const batchId = req.params.batchId;
@@ -793,12 +683,7 @@ async function processOneOutboundJob() {
       { userId },
       {
         $setOnInsert: { userId, createdAt: new Date() },
-        $set: {
-        number,
-        firstName: String(job.firstName || "").trim(),
-        lastName: String(job.lastName || "").trim(),
-        updatedAt: new Date()
-      },
+        $set: { number, updatedAt: new Date() },
         $push: { history: { $each: [{ role: "assistant", content: message }], $slice: -30 } },
       },
       { upsert: true }
