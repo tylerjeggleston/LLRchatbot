@@ -310,7 +310,9 @@ async function sendEscalationAlerts({ from, text, matchedKeywords }) {
   if (!matchedKeywords.length || !cfg.targets.length) return;
 
   // Find session by digits-based userId (your standard) or by number
-  const userId = normalizeUserIdFromPhone(from);
+  const userId =
+  String(payload.userId || "").trim() ||
+  normalizeUserIdFromPhone(from);
   const session = await sessions.findOne(
     { userId },
     { projection: { firstName: 1, lastName: 1, history: { $slice: -30 } } }
@@ -442,7 +444,9 @@ app.post("/webhook/notificationapi/sms", async (req, res) => {
     const { from, text, lastTrackingId } = payload;
     if (!from || typeof text !== "string") return res.status(200).json({ ok: true, ignored: "missing_fields" });
 
-    const userId = normalizeUserIdFromPhone(from);
+    const userId =
+  String(payload.userId || "").trim() ||
+  normalizeUserIdFromPhone(from);
 
     const upper = text.trim().toUpperCase();
     if (["STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"].includes(upper)) {
