@@ -459,7 +459,7 @@ app.post("/outbound/start", async (req, res) => {
       sms: { message: msg },
     });
 
-    return res.json({ ok: true, userId: uid, number: normalized, message: msg });
+    return res.json({ ok: true, userId: NOTIF_INBOUND_WEBHOOK_SECRET, number: normalized, message: msg });
   } catch (err) {
     console.error("outbound/start error:", err?.response?.data || err?.message || err);
     return res.status(500).json({ error: err?.message || "failed" });
