@@ -477,148 +477,210 @@ app.post("/outbound/start", async (req, res) => {
 
 // ----------------- INBOUND WEBHOOK -----------------
 app.post("/webhook/notificationapi/sms", async (req, res) => {
-
-  const textLower = text.toLowerCase();
-  const dnc = await dncKeywords.find({ enabled: true }).toArray();
-  const matchedDnc = dnc.find(k => textLower.includes(k.keyword));
-
-  if (matchedDnc) {
-  // Mark session as opted out
-  await sessions.updateOne(
-    { userId },
-    {
-      $set: {
-        optedOut: true,
-        optedOutAt: new Date(),
-        updatedAt: new Date()
-      },
-      $push: {
-        history: { role: "user", content: text }
-      }
-    },
-    { upsert: true }
-  );
-
-  // Log event
-  await dncEvents.insertOne({
-    userId,
-    from,
-    keyword: matchedDnc.keyword,
-    text,
-    createdAt: new Date()
-  });
-
-  // Optional confirmation reply (carrier-safe)
-  // await notificationapi.send({
-  //   type: "ai_sms_chat",
-  //   to: { id: userId, number: from },
-  //   sms: { message: "You’ve been opted out. No further messages will be sent." }
-  // });
-
-  return res.status(200).json({ ok: true, opted_out: true });
-}
   try {
-    if (req.query.token !== NOTIF_INBOUND_WEBHOOK_SECRET) return res.status(401).send("unauthorized");
+    // 0. Auth
+    if (req.query.token !== NOTIF_INBOUND_WEBHOOK_SECRET) {
+      return res.status(401).send("unauthorized");
+    }
 
     const payload = req.body || {};
     if (payload.eventType !== "SMS_INBOUND") {
       return res.status(200).json({ ok: true, ignored: payload.eventType || true });
     }
 
+    // 1. Parse payload FIRST
     const { from, text, lastTrackingId } = payload;
-    if (!from || typeof text !== "string") return res.status(200).json({ ok: true, ignored: "missing_fields" });
+    if (!from || typeof text !== "string") {
+      return res.status(200).json({ ok: true, ignored: "missing_fields" });
+    }
 
     const userId =
-  String(payload.userId || "").trim() ||
-  normalizeUserIdFromPhone(from);
+      String(payload.userId || "").trim() ||
+      normalizeUserIdFromPhone(from);
 
+    const textLower = text.toLowerCase();
     const upper = text.trim().toUpperCase();
-    if (["STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"].includes(upper)) {
+
+    // 2. Load existing session (for permanent opt-out)
+    const existingSession = await sessions.findOne({ userId });
+
+    // 🔒 HARD GUARD: already opted out → never reply again
+    if (existingSession?.optedOut) {
       return res.status(200).json({ ok: true, opted_out: true });
     }
 
-    if (isEmojiOnly(text)) return res.status(200).json({ ok: true, emoji_only: true });
+    // 3. Keyword-based DNC (admin-defined)
+    const dnc = await dncKeywords.find({ enabled: true }).toArray();
+    const matchedDnc = dnc.find(k => textLower.includes(k.keyword));
 
-    // dedupe retries
+    if (matchedDnc) {
+      await sessions.updateOne(
+        { userId },
+        {
+          $set: {
+            userId,
+            number: from,
+            optedOut: true,
+            optedOutAt: new Date(),
+            updatedAt: new Date()
+          },
+          $push: {
+            history: { role: "user", content: text }
+          }
+        },
+        { upsert: true }
+      );
+
+      await dncEvents.insertOne({
+        userId,
+        from,
+        keyword: matchedDnc.keyword,
+        text,
+        createdAt: new Date()
+      });
+
+      // optional carrier-safe confirmation (still commented)
+      // await notificationapi.send({ ... });
+
+      return res.status(200).json({ ok: true, opted_out: true });
+    }
+
+    // 4. Carrier STOP words (persist them too)
+    if (["STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"].includes(upper)) {
+      await sessions.updateOne(
+        { userId },
+        {
+          $set: {
+            userId,
+            number: from,
+            optedOut: true,
+            optedOutAt: new Date(),
+            updatedAt: new Date()
+          },
+          $push: {
+            history: { role: "user", content: text }
+          }
+        },
+        { upsert: true }
+      );
+
+      return res.status(200).json({ ok: true, opted_out: true });
+    }
+
+    // 5. Emoji-only ignore
+    if (isEmojiOnly(text)) {
+      return res.status(200).json({ ok: true, emoji_only: true });
+    }
+
+    // 6. Dedupe retries
     if (lastTrackingId) {
       try {
-        await webhookEvents.insertOne({ trackingId: lastTrackingId, createdAt: new Date() });
+        await webhookEvents.insertOne({
+          trackingId: lastTrackingId,
+          createdAt: new Date()
+        });
       } catch (e) {
-        if (String(e?.code) === "11000") return res.status(200).json({ ok: true, deduped: true });
+        if (String(e?.code) === "11000") {
+          return res.status(200).json({ ok: true, deduped: true });
+        }
         throw e;
       }
     }
 
-    // Save inbound message
+    // 7. Save inbound message
     await sessions.updateOne(
       { userId },
       {
         $setOnInsert: { userId, createdAt: new Date() },
         $set: {
-        number: from,
-        updatedAt: new Date(),
-        lastInboundAt: new Date()
-      },
-        $push: { history: { $each: [{ role: "user", content: text }], $slice: -30 } },
+          number: from,
+          updatedAt: new Date(),
+          lastInboundAt: new Date()
+        },
+        $push: {
+          history: {
+            $each: [{ role: "user", content: text }],
+            $slice: -30
+          }
+        }
       },
       { upsert: true }
     );
 
-    // Escalation check
+    // 8. Escalation logic (unchanged)
     const cfg = await getEscalationConfig();
-    const lower = text.toLowerCase();
-    const matched = cfg.keywords.filter((k) => k && lower.includes(k));
-   if (matched.length) {
-  try {
-    const session = await sessions.findOne(
-      { userId },
-      { projection: { firstName: 1, lastName: 1, history: { $slice: -30 } } }
-    );
+    const matched = cfg.keywords.filter(k => k && textLower.includes(k));
 
-    const firstName = String(session?.firstName || "").trim();
-    const lastName = String(session?.lastName || "").trim();
+    if (matched.length) {
+      try {
+        const session = await sessions.findOne(
+          { userId },
+          { projection: { firstName: 1, lastName: 1, history: { $slice: -30 } } }
+        );
 
-    const history = session?.history || [];
-    const lastOutbound = [...history].reverse().find((m) => m?.role === "assistant" || m?.role === "agent");
-    const previousAssistantMessage = lastOutbound?.content ? String(lastOutbound.content).slice(0, 500) : "";
+        const firstName = String(session?.firstName || "").trim();
+        const lastName = String(session?.lastName || "").trim();
 
-    await escalationEvents.insertOne({
-      createdAt: new Date(),
-      from,
-      firstName,
-      lastName,
-      matchedKeywords: matched,
-      triggerText: String(text).slice(0, 800),
-      previousAssistantMessage,
-      alertedTargets: cfg.targets || [],
+        const history = session?.history || [];
+        const lastOutbound = [...history].reverse().find(
+          m => m?.role === "assistant" || m?.role === "agent"
+        );
+
+        const previousAssistantMessage = lastOutbound?.content
+          ? String(lastOutbound.content).slice(0, 500)
+          : "";
+
+        await escalationEvents.insertOne({
+          createdAt: new Date(),
+          from,
+          firstName,
+          lastName,
+          matchedKeywords: matched,
+          triggerText: String(text).slice(0, 800),
+          previousAssistantMessage,
+          alertedTargets: cfg.targets || []
+        });
+
+        await sendEscalationAlerts({
+          userId,
+          from,
+          text,
+          matchedKeywords: matched
+        });
+      } catch (error) {
+        console.error("Escalation alert error:", error?.message || error);
+      }
+
+      // 🔕 IMPORTANT: no AI reply after escalation
+      return res.status(200).json({
+        ok: true,
+        escalated: true,
+        matchedKeywords: matched
+      });
+    }
+
+    // 9. No escalation → enqueue AI reply
+    const trackingId = lastTrackingId || `${userId}:${Date.now()}`;
+    try {
+      await replyJobs.insertOne({
+        trackingId,
+        userId,
+        from,
+        text,
+        status: "queued",
+        runAt: new Date(Date.now() + REPLY_DELAY_MS),
+        createdAt: new Date()
+      });
+    } catch (e) {
+      if (String(e?.code) !== "11000") throw e;
+    }
+
+    return res.status(200).json({
+      ok: true,
+      scheduled: true,
+      delayMs: REPLY_DELAY_MS,
+      userId
     });
-
-    await sendEscalationAlerts({ userId, from, text, matchedKeywords: matched });
-  } catch (error) {
-    console.error("Escalation alert error:", error?.message || error);
-  }
-
-  // ✅ IMPORTANT: return early so AI does NOT reply
-  return res.status(200).json({ ok: true, escalated: true, matchedKeywords: matched });
-}
-
-// ✅ No escalation → enqueue AI reply
-const trackingId = lastTrackingId || `${userId}:${Date.now()}`;
-try {
-  await replyJobs.insertOne({
-    trackingId,
-    userId,
-    from,
-    text,
-    status: "queued",
-    runAt: new Date(Date.now() + REPLY_DELAY_MS),
-    createdAt: new Date(),
-  });
-} catch (e) {
-  if (String(e?.code) !== "11000") throw e;
-}
-
-return res.status(200).json({ ok: true, scheduled: true, delayMs: REPLY_DELAY_MS, userId });
 
   } catch (err) {
     console.error("🔥 webhook fatal:", err?.response?.data || err?.message || err);
