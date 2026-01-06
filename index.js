@@ -1266,9 +1266,20 @@ app.post("/api/dnc/keywords", requireAdmin, async (req, res) => {
 });
 
 app.get("/api/targets", async (req, res) => {
-  const items = await targets.find({}).sort({ createdAt: -1 }).toArray();
-  res.json({ items });
+  try {
+    const items = await escalationTargets
+      .find({ enabled: true })
+      .sort({ createdAt: -1 })
+      .project({ _id: 0, name: 1, number: 1 })
+      .toArray();
+
+    res.json({ items });
+  } catch (err) {
+    console.error("targets fetch error:", err);
+    res.status(500).json({ items: [] });
+  }
 });
+
 
 
 app.patch("/api/dnc/keywords/:keyword", requireAdmin, async (req, res) => {
