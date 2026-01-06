@@ -459,7 +459,7 @@ app.post("/outbound/start", async (req, res) => {
       sms: { message: msg },
     });
 
-    return res.json({ ok: true, userId: NOTIF_INBOUND_WEBHOOK_SECRET, number: normalized, message: msg });
+    return res.json({ ok: true, userId: uid, number: normalized, message: msg });
   } catch (err) {
     console.error("outbound/start error:", err?.response?.data || err?.message || err);
     return res.status(500).json({ error: err?.message || "failed" });
@@ -505,7 +505,11 @@ app.post("/webhook/notificationapi/sms", async (req, res) => {
       { userId },
       {
         $setOnInsert: { userId, createdAt: new Date() },
-        $set: { number: from, updatedAt: new Date() },
+        $set: {
+        number: from,
+        updatedAt: new Date(),
+        lastInboundAt: new Date()
+      },
         $push: { history: { $each: [{ role: "user", content: text }], $slice: -30 } },
       },
       { upsert: true }
@@ -901,19 +905,34 @@ app.get("/api/conversations", async (req, res) => {
   const limit = Math.min(Number(req.query.limit || 50), 200);
 
   const items = await sessions
-    .find({}, { projection: { userId: 1, number: 1, updatedAt: 1, history: { $slice: -1 } } })
-    .sort({ updatedAt: -1 })
+    .find({}, {
+      projection: {
+        userId: 1,
+        number: 1,
+        updatedAt: 1,
+        lastInboundAt: 1,
+        lastAgentAt: 1,
+        history: { $slice: -1 }
+      }
+    }).sort({ updatedAt: -1 })
     .limit(limit)
     .toArray();
 
   res.json({
-    items: items.map((d) => ({
-      userId: d.userId,
-      number: d.number,
-      updatedAt: d.updatedAt,
-      lastMessage: d.history?.[0]?.content || "",
-      lastRole: d.history?.[0]?.role || "",
-    })),
+    items: items.map((d) => {
+  const unread =
+    d.lastInboundAt &&
+    (!d.lastAgentAt || new Date(d.lastInboundAt) > new Date(d.lastAgentAt));
+
+  return {
+    userId: d.userId,
+    number: d.number,
+    updatedAt: d.updatedAt,
+    lastMessage: d.history?.[0]?.content || "",
+    lastRole: d.history?.[0]?.role || "",
+    unread
+  };
+  }),
   });
 });
 
@@ -945,7 +964,11 @@ app.post("/api/conversations/:userId/send", async (req, res) => {
   await sessions.updateOne(
     { userId: doc.userId },
     {
-      $set: { updatedAt: new Date() },
+      $set: {
+      updatedAt: new Date(),
+      lastAgentAt: new Date()
+    },
+
       $push: { history: { $each: [{ role: "agent", content: String(message) }], $slice: -50 } },
     }
   );

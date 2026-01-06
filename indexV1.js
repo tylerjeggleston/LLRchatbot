@@ -55,10 +55,10 @@ const mongo = new MongoClient(MONGODB_URI);
 let sessions;
 let webhookEvents;
 let replyJobs;
-
+let botSettings;
 let escalationKeywords;
 let escalationTargets;
-
+let escalationEvents;
 let faqCollection;
 
 // NEW:
@@ -73,10 +73,10 @@ async function initDb() {
   sessions = db.collection("SMS_AI_Sessions");
   webhookEvents = db.collection("Webhook_Events");
   replyJobs = db.collection("SMS_AI_ReplyJobs");
-
+  botSettings = db.collection("Bot_Settings");
   escalationKeywords = db.collection("Escalation_Keywords");
   escalationTargets = db.collection("Escalation_Targets");
-
+  escalationEvents = db.collection("Escalation_Events");
   faqCollection = db.collection("FAQ_KB");
 
   outboundSettings = db.collection("Outbound_Settings");
@@ -87,7 +87,7 @@ async function initDb() {
   await sessions.createIndex({ userId: 1 }, { unique: true });
   await sessions.createIndex({ number: 1 });
   await sessions.createIndex({ updatedAt: -1 });
-
+  await botSettings.createIndex({ key: 1 }, { unique: true });
   // webhook dedupe
   await webhookEvents.createIndex({ trackingId: 1 }, { unique: true });
   await webhookEvents.createIndex({ createdAt: 1 }, { expireAfterSeconds: 7 * 24 * 3600 });
@@ -99,6 +99,11 @@ async function initDb() {
   // escalation
   await escalationKeywords.createIndex({ keyword: 1 }, { unique: true });
   await escalationTargets.createIndex({ number: 1 }, { unique: true });
+
+  await escalationEvents.createIndex({ createdAt: -1 });
+  await escalationEvents.createIndex({ from: 1, createdAt: -1 });
+  await escalationEvents.createIndex({ matchedKeywords: 1 });
+
 
   // FAQ KB
   await faqCollection.createIndex({ enabled: 1 });
@@ -118,6 +123,20 @@ async function initDb() {
   await outboundQueue.createIndex({ trackingId: 1 }, { unique: true });
 
   console.log("✅ Mongo connected");
+
+  await botSettings.updateOne(
+  { key: "overall_goal" },
+  {
+    $setOnInsert: {
+      key: "overall_goal",
+      goal: "Qualify buying intent and route hot leads to a human.",
+      enabled: true,
+      createdAt: new Date(),
+    },
+    $set: { updatedAt: new Date() },
+  },
+  { upsert: true }
+);
 
   // Ensure default template exists
   await outboundSettings.updateOne(
@@ -215,8 +234,14 @@ function takeLastMessages(history = [], max = 12) {
 }
 
 async function openaiReply({ userText, history, faqContext = "" }) {
-  const system = `
+  const goalCfg = await getOverallGoal();
+const overallGoalText = goalCfg.enabled && goalCfg.goal ? goalCfg.goal : "(none)";
+
+const system = `
 You are an AI SMS assistant. Be concise, helpful, and human.
+
+OVERALL GOAL (follow this strongly):
+${overallGoalText}
 
 Use the FAQ knowledge base below as the source of truth when relevant.
 If the answer is not in the FAQs, answer normally.
@@ -231,11 +256,23 @@ Rules:
 - If they ask for sensitive personal data, refuse.
 `;
 
+
+  function normalizeRole(role) {
+  if (role === "agent") return "assistant";
+  if (role === "customer") return "user";
+  if (role === "assistant" || role === "user" || role === "system" || role === "developer") return role;
+  return "assistant";
+}
+
+
   const messages = [
     { role: "system", content: system.trim() },
-    ...takeLastMessages(history, 12),
+    ...takeLastMessages(history, 12)
+      .filter(m => m && m.content)
+      .map(m => ({ role: normalizeRole(m.role), content: String(m.content) })),
     { role: "user", content: userText },
   ];
+
 
   const resp = await axios.post(
     "https://api.openai.com/v1/chat/completions",
@@ -261,22 +298,76 @@ async function getEscalationConfig() {
 
   escalationCache = {
     loadedAt: now,
-    keywords: kwDocs.map((d) => String(d.keyword || "").toLowerCase()).filter(Boolean),
+    keywords: kwDocs.map((d) => String(d.keyword || "").trim().toLowerCase()).filter(Boolean),
     targets: targetDocs.map((d) => String(d.number || "").trim()).filter(Boolean),
   };
 
   return escalationCache;
 }
 
-async function sendEscalationAlerts({ from, userId, text, matchedKeywords }) {
+let goalCache = { loadedAt: 0, goal: "", enabled: true };
+const GOAL_CACHE_MS = 10_000;
+
+async function getOverallGoal() {
+  const now = Date.now();
+  if (now - goalCache.loadedAt < GOAL_CACHE_MS) return goalCache;
+
+  const doc = await botSettings.findOne({ key: "overall_goal" });
+  goalCache = {
+    loadedAt: now,
+    goal: String(doc?.goal || "").trim(),
+    enabled: doc?.enabled !== false,
+  };
+  return goalCache;
+}
+
+
+// async function sendEscalationAlerts({ from, userId, text, matchedKeywords }) {
+//   const cfg = await getEscalationConfig();
+//   if (!matchedKeywords.length || !cfg.targets.length) return;
+
+//   const msg =
+//     `🚨 Keyword alert: ${matchedKeywords.join(", ")}\n` +
+//     `From: ${from}\n` +
+//     `UserId: ${userId}\n` +
+//     `Message: ${String(text).slice(0, 500)}`;
+
+//   await Promise.all(
+//     cfg.targets.map((targetNumber) =>
+//       notificationapi.send({
+//         type: "ai_sms_chat",
+//         to: { id: normalizeUserIdFromPhone(targetNumber), number: targetNumber },
+//         sms: { message: msg },
+//       })
+//     )
+//   );
+// }
+
+async function sendEscalationAlerts({ userId, from, text, matchedKeywords }) {
   const cfg = await getEscalationConfig();
   if (!matchedKeywords.length || !cfg.targets.length) return;
+
+  const session = await sessions.findOne(
+    { userId },
+    { projection: { firstName: 1, lastName: 1, history: { $slice: -30 } } }
+  );
+
+  const firstName = String(session?.firstName || "").trim();
+  const lastName = String(session?.lastName || "").trim();
+  const fullName = `${firstName} ${lastName}`.trim() || "Unknown";
+
+  const history = session?.history || [];
+  const lastOutbound = [...history].reverse().find((m) => m?.role === "assistant" || m?.role === "agent");
+  const previousMessage = lastOutbound?.content
+    ? String(lastOutbound.content).slice(0, 500)
+    : "(no previous outbound message found)";
 
   const msg =
     `🚨 Keyword alert: ${matchedKeywords.join(", ")}\n` +
     `From: ${from}\n` +
-    `UserId: ${userId}\n` +
-    `Message: ${String(text).slice(0, 500)}`;
+    `Name: ${fullName}\n` +
+    `Previous: ${previousMessage}\n` +
+    `Reply: ${String(text).slice(0, 500)}`;
 
   await Promise.all(
     cfg.targets.map((targetNumber) =>
@@ -288,6 +379,8 @@ async function sendEscalationAlerts({ from, userId, text, matchedKeywords }) {
     )
   );
 }
+
+
 
 // ---------- FAQ helpers ----------
 async function fetchRelevantFaqs(queryText, limit = 5) {
@@ -347,7 +440,12 @@ app.post("/outbound/start", async (req, res) => {
       { userId: uid },
       {
         $setOnInsert: { userId: uid, createdAt: new Date() },
-        $set: { number: normalized, updatedAt: new Date() },
+        $set: {
+          number: normalized,
+          firstName: String(firstName || "").trim(),
+          lastName: String(lastName || "").trim(),
+          updatedAt: new Date()
+        },
         $push: {
           history: { $each: [{ role: "assistant", content: msg }], $slice: -30 },
         },
@@ -381,7 +479,9 @@ app.post("/webhook/notificationapi/sms", async (req, res) => {
     const { from, text, lastTrackingId } = payload;
     if (!from || typeof text !== "string") return res.status(200).json({ ok: true, ignored: "missing_fields" });
 
-    const userId = normalizeUserIdFromPhone(from);
+    const userId =
+  String(payload.userId || "").trim() ||
+  normalizeUserIdFromPhone(from);
 
     const upper = text.trim().toUpperCase();
     if (["STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"].includes(upper)) {
@@ -415,31 +515,58 @@ app.post("/webhook/notificationapi/sms", async (req, res) => {
     const cfg = await getEscalationConfig();
     const lower = text.toLowerCase();
     const matched = cfg.keywords.filter((k) => k && lower.includes(k));
-    if (matched.length) {
-      try {
-        await sendEscalationAlerts({ from, userId, text, matchedKeywords: matched });
-      } catch (alertErr) {
-        console.error("⚠️ escalation alert failed:", alertErr?.response?.data || alertErr?.message || alertErr);
-      }
-    }
+   if (matched.length) {
+  try {
+    const session = await sessions.findOne(
+      { userId },
+      { projection: { firstName: 1, lastName: 1, history: { $slice: -30 } } }
+    );
 
-    // Enqueue delayed AI job
-    const trackingId = lastTrackingId || `${userId}:${Date.now()}`;
-    try {
-      await replyJobs.insertOne({
-        trackingId,
-        userId,
-        from,
-        text,
-        status: "queued",
-        runAt: new Date(Date.now() + REPLY_DELAY_MS),
-        createdAt: new Date(),
-      });
-    } catch (e) {
-      if (String(e?.code) !== "11000") throw e;
-    }
+    const firstName = String(session?.firstName || "").trim();
+    const lastName = String(session?.lastName || "").trim();
 
-    return res.status(200).json({ ok: true, scheduled: true, delayMs: REPLY_DELAY_MS, userId });
+    const history = session?.history || [];
+    const lastOutbound = [...history].reverse().find((m) => m?.role === "assistant" || m?.role === "agent");
+    const previousAssistantMessage = lastOutbound?.content ? String(lastOutbound.content).slice(0, 500) : "";
+
+    await escalationEvents.insertOne({
+      createdAt: new Date(),
+      from,
+      firstName,
+      lastName,
+      matchedKeywords: matched,
+      triggerText: String(text).slice(0, 800),
+      previousAssistantMessage,
+      alertedTargets: cfg.targets || [],
+    });
+
+    await sendEscalationAlerts({ userId, from, text, matchedKeywords: matched });
+  } catch (error) {
+    console.error("Escalation alert error:", error?.message || error);
+  }
+
+  // ✅ IMPORTANT: return early so AI does NOT reply
+  return res.status(200).json({ ok: true, escalated: true, matchedKeywords: matched });
+}
+
+// ✅ No escalation → enqueue AI reply
+const trackingId = lastTrackingId || `${userId}:${Date.now()}`;
+try {
+  await replyJobs.insertOne({
+    trackingId,
+    userId,
+    from,
+    text,
+    status: "queued",
+    runAt: new Date(Date.now() + REPLY_DELAY_MS),
+    createdAt: new Date(),
+  });
+} catch (e) {
+  if (String(e?.code) !== "11000") throw e;
+}
+
+return res.status(200).json({ ok: true, scheduled: true, delayMs: REPLY_DELAY_MS, userId });
+
   } catch (err) {
     console.error("🔥 webhook fatal:", err?.response?.data || err?.message || err);
     return res.status(200).json({ ok: false });
@@ -654,6 +781,26 @@ app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
   }
 });
 
+app.get("/api/escalation/events", async (req, res) => {
+  const limit = Math.min(Number(req.query.limit || 200), 500);
+
+  const phone = String(req.query.phone || "").trim();
+  const keyword = String(req.query.keyword || "").trim().toLowerCase();
+
+  const q = {};
+  if (phone) q.from = phone;
+  if (keyword) q.matchedKeywords = keyword;
+
+  const items = await escalationEvents
+    .find(q)
+    .sort({ createdAt: -1 })
+    .limit(limit)
+    .toArray();
+
+  res.json({ items });
+});
+
+
 // Batch progress
 app.get("/api/outbound/batch/:batchId", requireAdmin, async (req, res) => {
   const batchId = req.params.batchId;
@@ -683,7 +830,12 @@ async function processOneOutboundJob() {
       { userId },
       {
         $setOnInsert: { userId, createdAt: new Date() },
-        $set: { number, updatedAt: new Date() },
+        $set: {
+        number,
+        firstName: String(job.firstName || "").trim(),
+        lastName: String(job.lastName || "").trim(),
+        updatedAt: new Date()
+      },
         $push: { history: { $each: [{ role: "assistant", content: message }], $slice: -30 } },
       },
       { upsert: true }
@@ -899,6 +1051,36 @@ app.post("/api/faq", requireAdmin, async (req, res) => {
 
   res.json({ ok: true });
 });
+
+app.get("/api/bot/goal", requireAdmin, async (req, res) => {
+  const doc = await botSettings.findOne({ key: "overall_goal" });
+  res.json({
+    goal: doc?.goal || "",
+    enabled: Boolean(doc?.enabled),
+  });
+});
+
+app.post("/api/bot/goal", requireAdmin, async (req, res) => {
+  const goal = String(req.body?.goal || "").trim();
+  const enabled = typeof req.body?.enabled === "boolean" ? req.body.enabled : true;
+
+  if (!goal) return res.status(400).json({ error: "goal_required" });
+
+  await botSettings.updateOne(
+    { key: "overall_goal" },
+    {
+      $set: { goal, enabled, updatedAt: new Date() },
+      $setOnInsert: { key: "overall_goal", createdAt: new Date() },
+    },
+    { upsert: true }
+  );
+
+  // invalidate cache (we'll add it below)
+  goalCache.loadedAt = 0;
+
+  res.json({ ok: true });
+});
+
 
 app.patch("/api/faq/:id", requireAdmin, async (req, res) => {
   const id = req.params.id;
