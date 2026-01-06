@@ -862,12 +862,13 @@ app.get("/api/inbox/stats", async (req, res) => {
 // Body: { rows: [{ firstName, lastName, phone }], spacingMs?: 5000, defaultCountryCode?: "1" }
 app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
   try {
-    const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    const { rows, spacingMs, assignedTarget } = req.body;
+
     if (!rows.length) return res.status(400).json({ error: "rows_required" });
     if (rows.length > 5000) return res.status(400).json({ error: "too_many_rows" });
 
     const settings = await getFirstMessageTemplate();
-    const spacingMs = Number(req.body?.spacingMs || OUTBOUND_SPACING_MS);
+
     const defaultCountryCode = String(req.body?.defaultCountryCode || settings.defaultCountryCode || "1");
 
     const batchId = new ObjectId().toString();
@@ -887,6 +888,7 @@ app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
       sent: 0,
       failed: 0,
       spacingMs,
+      assignedTarget: assignedTarget || null,
       createdAt: new Date(),
       updatedAt: new Date(),
     });
@@ -1007,6 +1009,7 @@ async function processOneOutboundJob() {
         number,
         firstName: String(job.firstName || "").trim(),
         lastName: String(job.lastName || "").trim(),
+        assignedTarget: assignedTarget || null,
         updatedAt: new Date()
       },
         $push: { history: { $each: [{ role: "assistant", content: message, createdAt: new Date() }], $slice: -30 } },
@@ -1261,6 +1264,12 @@ app.post("/api/dnc/keywords", requireAdmin, async (req, res) => {
 
   res.json({ ok: true });
 });
+
+app.get("/api/targets", async (req, res) => {
+  const items = await targets.find({}).sort({ createdAt: -1 }).toArray();
+  res.json({ items });
+});
+
 
 app.patch("/api/dnc/keywords/:keyword", requireAdmin, async (req, res) => {
   const keyword = decodeURIComponent(req.params.keyword);
