@@ -660,6 +660,16 @@ function startReplyWorker() {
 
 // ----------------- Bulk Outbound API + Worker -----------------
 
+// GET /api/inbox/unread-count
+app.get("/api/inbox/unread-count", async (req, res) => {
+  const count = await db.collection("conversations").countDocuments({
+    unreadCount: { $gt: 0 }
+  });
+
+  res.json({ unreadCount: count });
+});
+
+
 // Get/set template
 app.get("/api/outbound/template", requireAdmin, async (req, res) => {
   const doc = await getFirstMessageTemplate();
