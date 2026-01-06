@@ -810,6 +810,54 @@ app.post("/api/outbound/template", requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
+// GET /api/inbox/stats
+app.get("/api/inbox/stats", async (req, res) => {
+  try {
+    const agg = await sessions.aggregate([
+      {
+        $project: {
+          outboundCount: {
+            $size: {
+              $filter: {
+                input: "$history",
+                as: "m",
+                cond: { $eq: ["$$m.role", "assistant"] }
+              }
+            }
+          },
+          inboundCount: {
+            $size: {
+              $filter: {
+                input: "$history",
+                as: "m",
+                cond: { $eq: ["$$m.role", "user"] }
+              }
+            }
+          }
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          outbound: { $sum: "$outboundCount" },
+          inbound: { $sum: "$inboundCount" }
+        }
+      }
+    ]).toArray();
+
+    const row = agg[0] || { outbound: 0, inbound: 0 };
+
+    res.json({
+      outbound: row.outbound,
+      inbound: row.inbound
+    });
+  } catch (e) {
+    console.error("stats error:", e);
+    res.json({ outbound: 0, inbound: 0 });
+  }
+});
+
+
 // Create batch: frontend posts rows JSON parsed from CSV
 // Body: { rows: [{ firstName, lastName, phone }], spacingMs?: 5000, defaultCountryCode?: "1" }
 app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
