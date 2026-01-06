@@ -358,7 +358,7 @@ async function sendEscalationAlerts({ userId, from, text, matchedKeywords }) {
 
   const session = await sessions.findOne(
     { userId },
-    { projection: { firstName: 1, lastName: 1, history: { $slice: -30 } } }
+    { projection: { firstName: 1, lastName: 1, history: { $slice: -30 },  } }
   );
 
   const firstName = String(session?.firstName || "").trim();
@@ -456,7 +456,7 @@ app.post("/outbound/start", async (req, res) => {
           updatedAt: new Date()
         },
         $push: {
-          history: { $each: [{ role: "assistant", content: msg }], $slice: -30 },
+          history: { $each: [{ role: "assistant", content: msg, createdAt: new Date() }], $slice: -30 },
         },
       },
       { upsert: true }
@@ -525,7 +525,7 @@ app.post("/webhook/notificationapi/sms", async (req, res) => {
             updatedAt: new Date()
           },
           $push: {
-            history: { role: "user", content: text }
+            history: { role: "user", content: text, createdAt: new Date() }
           }
         },
         { upsert: true }
@@ -558,7 +558,7 @@ app.post("/webhook/notificationapi/sms", async (req, res) => {
             updatedAt: new Date()
           },
           $push: {
-            history: { role: "user", content: text }
+            history: { role: "user", content: text, createdAt: new Date() }
           }
         },
         { upsert: true }
@@ -599,7 +599,7 @@ app.post("/webhook/notificationapi/sms", async (req, res) => {
         },
         $push: {
           history: {
-            $each: [{ role: "user", content: text }],
+            $each: [{ role: "user", content: text, createdAt: new Date() }],
             $slice: -30
           }
         }
@@ -738,7 +738,7 @@ async function processOneDueJob() {
 
     await sessions.updateOne(
       { userId },
-      { $set: { updatedAt: new Date() }, $push: { history: { $each: [{ role: "assistant", content: reply }], $slice: -30 } } },
+      { $set: { updatedAt: new Date() }, $push: { history: { $each: [{ role: "assistant", content: reply, createdAt: new Date() }], $slice: -30 } } },
       { upsert: true }
     );
 
@@ -1009,7 +1009,7 @@ async function processOneOutboundJob() {
         lastName: String(job.lastName || "").trim(),
         updatedAt: new Date()
       },
-        $push: { history: { $each: [{ role: "assistant", content: message }], $slice: -30 } },
+        $push: { history: { $each: [{ role: "assistant", content: message, createdAt: new Date() }], $slice: -30 } },
       },
       { upsert: true }
     );
@@ -1138,7 +1138,7 @@ app.post("/api/conversations/:userId/send", async (req, res) => {
       lastAgentAt: new Date()
     },
 
-      $push: { history: { $each: [{ role: "agent", content: String(message) }], $slice: -50 } },
+      $push: { history: { $each: [{ role: "agent", content: String(message) , createdAt: new Date()}], $slice: -50 } },
     }
   );
 
