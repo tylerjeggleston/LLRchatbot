@@ -60,7 +60,8 @@ let escalationKeywords;
 let escalationTargets;
 let escalationEvents;
 let faqCollection;
-
+let dncKeywords;
+let dncEvents;
 // NEW:
 let outboundSettings;
 let outboundBatches;
@@ -78,6 +79,9 @@ async function initDb() {
   escalationTargets = db.collection("Escalation_Targets");
   escalationEvents = db.collection("Escalation_Events");
   faqCollection = db.collection("FAQ_KB");
+  dncKeywords = db.collection("DNC_Keywords");
+  dncEvents = db.collection("DNC_Events");
+
 
   outboundSettings = db.collection("Outbound_Settings");
   outboundBatches = db.collection("Outbound_Batches");
@@ -121,6 +125,11 @@ async function initDb() {
   await outboundQueue.createIndex({ batchId: 1, runAt: 1 });
   await outboundQueue.createIndex({ status: 1, runAt: 1 });
   await outboundQueue.createIndex({ trackingId: 1 }, { unique: true });
+
+  await dncKeywords.createIndex({ keyword: 1 }, { unique: true });
+  await dncKeywords.createIndex({ enabled: 1 });
+
+  await dncEvents.createIndex({ userId: 1, createdAt: -1 });
 
   console.log("✅ Mongo connected");
 
@@ -468,6 +477,46 @@ app.post("/outbound/start", async (req, res) => {
 
 // ----------------- INBOUND WEBHOOK -----------------
 app.post("/webhook/notificationapi/sms", async (req, res) => {
+
+  const textLower = text.toLowerCase();
+  const dnc = await dncKeywords.find({ enabled: true }).toArray();
+  const matchedDnc = dnc.find(k => textLower.includes(k.keyword));
+
+  if (matchedDnc) {
+  // Mark session as opted out
+  await sessions.updateOne(
+    { userId },
+    {
+      $set: {
+        optedOut: true,
+        optedOutAt: new Date(),
+        updatedAt: new Date()
+      },
+      $push: {
+        history: { role: "user", content: text }
+      }
+    },
+    { upsert: true }
+  );
+
+  // Log event
+  await dncEvents.insertOne({
+    userId,
+    from,
+    keyword: matchedDnc.keyword,
+    text,
+    createdAt: new Date()
+  });
+
+  // Optional confirmation reply (carrier-safe)
+  // await notificationapi.send({
+  //   type: "ai_sms_chat",
+  //   to: { id: userId, number: from },
+  //   sms: { message: "You’ve been opted out. No further messages will be sent." }
+  // });
+
+  return res.status(200).json({ ok: true, opted_out: true });
+}
   try {
     if (req.query.token !== NOTIF_INBOUND_WEBHOOK_SECRET) return res.status(401).send("unauthorized");
 
@@ -1084,6 +1133,44 @@ app.post("/api/faq", requireAdmin, async (req, res) => {
 
   res.json({ ok: true });
 });
+
+app.get("/api/dnc/keywords", requireAdmin, async (req, res) => {
+  const items = await dncKeywords.find({}).sort({ keyword: 1 }).toArray();
+  res.json({ items });
+});
+
+app.post("/api/dnc/keywords", requireAdmin, async (req, res) => {
+  const keyword = String(req.body?.keyword || "").trim().toLowerCase();
+  if (!keyword) return res.status(400).json({ error: "keyword_required" });
+
+  await dncKeywords.updateOne(
+    { keyword },
+    { $setOnInsert: { keyword, enabled: true, createdAt: new Date() } },
+    { upsert: true }
+  );
+
+  res.json({ ok: true });
+});
+
+app.patch("/api/dnc/keywords/:keyword", requireAdmin, async (req, res) => {
+  const keyword = decodeURIComponent(req.params.keyword);
+  const enabled = Boolean(req.body?.enabled);
+
+  await dncKeywords.updateOne(
+    { keyword },
+    { $set: { enabled, updatedAt: new Date() } }
+  );
+
+  res.json({ ok: true });
+});
+
+
+app.delete("/api/dnc/keywords/:keyword", requireAdmin, async (req, res) => {
+  const keyword = decodeURIComponent(req.params.keyword);
+  await dncKeywords.deleteOne({ keyword });
+  res.json({ ok: true });
+});
+
 
 app.get("/api/bot/goal", requireAdmin, async (req, res) => {
   const doc = await botSettings.findOne({ key: "overall_goal" });
