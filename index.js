@@ -489,7 +489,7 @@ app.post("/webhook/notificationapi/sms", async (req, res) => {
     }
 
     // 1. Parse payload FIRST
-    const { from, text, lastTrackingId } = payload;
+    const { from, firstName,lastName, text, lastTrackingId } = payload;
     if (!from || typeof text !== "string") {
       return res.status(200).json({ ok: true, ignored: "missing_fields" });
     }
@@ -520,6 +520,8 @@ app.post("/webhook/notificationapi/sms", async (req, res) => {
           $set: {
             userId,
             number: from,
+            firstName,
+            lastName,
             optedOut: true,
             optedOutAt: new Date(),
             updatedAt: new Date()
@@ -553,6 +555,8 @@ app.post("/webhook/notificationapi/sms", async (req, res) => {
           $set: {
             userId,
             number: from,
+            firstName,
+            lastName,
             optedOut: true,
             optedOutAt: new Date(),
             updatedAt: new Date()
@@ -594,6 +598,8 @@ app.post("/webhook/notificationapi/sms", async (req, res) => {
         $setOnInsert: { userId, createdAt: new Date() },
         $set: {
           number: from,
+          firstName,
+          lastName,
           updatedAt: new Date(),
           lastInboundAt: new Date()
         },
@@ -772,13 +778,26 @@ function startReplyWorker() {
 // ----------------- Bulk Outbound API + Worker -----------------
 
 // GET /api/inbox/unread-count
+// GET /api/inbox/unread-count
 app.get("/api/inbox/unread-count", async (req, res) => {
-  const count = await db.collection("conversations").countDocuments({
-    unreadCount: { $gt: 0 }
-  });
+  try {
+    const count = await sessions.countDocuments({
+      lastInboundAt: { $exists: true },
+      $expr: {
+        $or: [
+          { $not: ["$lastAgentAt"] },
+          { $gt: ["$lastInboundAt", "$lastAgentAt"] }
+        ]
+      }
+    });
 
-  res.json({ unreadCount: count });
+    res.json({ unreadCount: count });
+  } catch (e) {
+    console.error("unread-count error:", e);
+    res.status(500).json({ unreadCount: 0 });
+  }
 });
+
 
 
 // Get/set template
@@ -1001,6 +1020,11 @@ async function processOneOutboundJob() {
 
   try {
     // Create session + save first message
+    const batch = await outboundBatches.findOne(
+      { _id: batchId },
+      { projection: { assignedTarget: 1 } }
+    );
+
     await sessions.updateOne(
       { userId },
       {
@@ -1009,7 +1033,7 @@ async function processOneOutboundJob() {
         number,
         firstName: String(job.firstName || "").trim(),
         lastName: String(job.lastName || "").trim(),
-        assignedTarget: assignedTarget || null,
+        assignedTarget: batch?.assignedTarget || null,
         updatedAt: new Date()
       },
         $push: { history: { $each: [{ role: "assistant", content: message, createdAt: new Date() }], $slice: -30 } },
