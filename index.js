@@ -905,6 +905,44 @@ app.get("/api/inbox/stats", async (req, res) => {
   }
 });
 
+app.post("/api/conversations/:userId/hide", async (req, res) => {
+  try {
+    await sessions.updateOne(
+      { userId: req.params.userId },
+      {
+        $set: {
+          hidden: true,
+          updatedAt: new Date()
+        }
+      }
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("hide error:", e);
+    res.status(500).json({ ok: false });
+  }
+});
+
+
+app.post("/api/conversations/:userId/restore", async (req, res) => {
+  try {
+    await sessions.updateOne(
+      { userId: req.params.userId },
+      {
+        $set: {
+          hidden: false,
+          updatedAt: new Date()
+        }
+      }
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("restore error:", e);
+    res.status(500).json({ ok: false });
+  }
+});
+
+
 
 
 // Create batch: frontend posts rows JSON parsed from CSV
@@ -1131,7 +1169,7 @@ app.get("/api/conversations", async (req, res) => {
   const limit = Math.min(Number(req.query.limit || 50), 200);
 
   const items = await sessions
-    .find({}, {
+    .find({ hidden: { $ne: true } }, {
       projection: {
       userId: 1,
       number: 1,
@@ -1164,7 +1202,8 @@ const unread =
   updatedAt: d.updatedAt,
   lastMessage: d.history?.[0]?.content || "",
   lastRole: d.history?.[0]?.role || "",
-  unread
+  unread,
+  hidden: !!d.hidden
 };
   }),
   });
