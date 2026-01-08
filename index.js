@@ -242,6 +242,15 @@ function takeLastMessages(history = [], max = 12) {
   return history.slice(Math.max(0, history.length - max));
 }
 
+function normalizeTextForMatching(text = "") {
+  return text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ") // remove punctuation (commas, dots, etc)
+    .replace(/\s+/g, " ")             // collapse spaces
+    .trim();
+}
+
+
 async function openaiReply({ userText, history, faqContext = "" }) {
   const goalCfg = await getOverallGoal();
 const overallGoalText = goalCfg.enabled && goalCfg.goal ? goalCfg.goal : "(none)";
@@ -615,7 +624,17 @@ app.post("/webhook/notificationapi/sms", async (req, res) => {
 
     // 8. Escalation logic (unchanged)
     const cfg = await getEscalationConfig();
-    const matched = cfg.keywords.filter(k => k && textLower.includes(k));
+    const normalizedText = normalizeTextForMatching(text);
+
+    const matched = cfg.keywords.filter(k => {
+      if (!k) return false;
+      const keyword = normalizeTextForMatching(k);
+
+      // match whole words only
+      const regex = new RegExp(`\\b${keyword}\\b`, "i");
+      return regex.test(normalizedText);
+    });
+
 
     if (matched.length) {
       try {
@@ -994,6 +1013,28 @@ app.get("/api/escalation/events", async (req, res) => {
   res.json({ items });
 });
 
+// Mark conversation as read when opened
+app.post("/api/conversations/:userId/read", async (req, res) => {
+  try {
+    await sessions.updateOne(
+      { userId: req.params.userId },
+      {
+        $set: {
+          lastViewedAt: new Date(),
+          updatedAt: new Date()
+        }
+      }
+    );
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("mark-read error:", e);
+    res.status(500).json({ ok: false });
+  }
+});
+
+
+
 
 // Batch progress
 app.get("/api/outbound/batch/:batchId", requireAdmin, async (req, res) => {
@@ -1118,9 +1159,12 @@ app.get("/api/conversations", async (req, res) => {
 
   res.json({
     items: items.map((d) => {
-  const unread =
-    d.lastInboundAt &&
-    (!d.lastAgentAt || new Date(d.lastInboundAt) > new Date(d.lastAgentAt));
+ const lastSeen = d.lastViewedAt || d.lastAgentAt;
+
+const unread =
+  d.lastInboundAt &&
+  (!lastSeen || new Date(d.lastInboundAt) > new Date(lastSeen));
+
 
   return {
   userId: d.userId,
