@@ -1103,13 +1103,15 @@ app.get("/api/conversations", async (req, res) => {
   const items = await sessions
     .find({}, {
       projection: {
-        userId: 1,
-        number: 1,
-        updatedAt: 1,
-        lastInboundAt: 1,
-        lastAgentAt: 1,
-        history: { $slice: -1 }
-      }
+      userId: 1,
+      number: 1,
+      firstName: 1,
+      lastName: 1,
+      updatedAt: 1,
+      lastInboundAt: 1,
+      lastAgentAt: 1,
+      history: { $slice: -1 }
+    }
     }).sort({ updatedAt: -1 })
     .limit(limit)
     .toArray();
@@ -1121,13 +1123,15 @@ app.get("/api/conversations", async (req, res) => {
     (!d.lastAgentAt || new Date(d.lastInboundAt) > new Date(d.lastAgentAt));
 
   return {
-    userId: d.userId,
-    number: d.number,
-    updatedAt: d.updatedAt,
-    lastMessage: d.history?.[0]?.content || "",
-    lastRole: d.history?.[0]?.role || "",
-    unread
-  };
+  userId: d.userId,
+  number: d.number,
+  firstName: d.firstName || "",
+  lastName: d.lastName || "",
+  updatedAt: d.updatedAt,
+  lastMessage: d.history?.[0]?.content || "",
+  lastRole: d.history?.[0]?.role || "",
+  unread
+};
   }),
   });
 });
@@ -1139,6 +1143,8 @@ app.get("/api/conversations/:userId", async (req, res) => {
   res.json({
     userId: doc.userId,
     number: doc.number,
+    firstName: doc.firstName || "",
+    lastName: doc.lastName || "",
     updatedAt: doc.updatedAt,
     history: doc.history || [],
   });
