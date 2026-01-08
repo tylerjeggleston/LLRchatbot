@@ -1013,28 +1013,6 @@ app.get("/api/escalation/events", async (req, res) => {
   res.json({ items });
 });
 
-// Mark conversation as read when opened
-app.post("/api/conversations/:userId/read", async (req, res) => {
-  try {
-    await sessions.updateOne(
-      { userId: req.params.userId },
-      {
-        $set: {
-          lastViewedAt: new Date(),
-          updatedAt: new Date()
-        }
-      }
-    );
-
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("mark-read error:", e);
-    res.status(500).json({ ok: false });
-  }
-});
-
-
-
 
 // Batch progress
 app.get("/api/outbound/batch/:batchId", requireAdmin, async (req, res) => {
@@ -1151,6 +1129,7 @@ app.get("/api/conversations", async (req, res) => {
       updatedAt: 1,
       lastInboundAt: 1,
       lastAgentAt: 1,
+      lastViewedAt: 1,
       history: { $slice: -1 }
     }
     }).sort({ updatedAt: -1 })
@@ -1222,27 +1201,27 @@ app.post("/api/conversations/:userId/send", async (req, res) => {
   res.json({ ok: true });
 });
 
-// Mark conversation as read (on open)
+
+// Mark conversation as read when opened
 app.post("/api/conversations/:userId/read", async (req, res) => {
   try {
-    const userId = req.params.userId;
-
     await sessions.updateOne(
-      { userId },
+      { userId: req.params.userId },
       {
         $set: {
-          lastAgentAt: new Date(), // 👈 THIS IS THE KEY
-          updatedAt: new Date(),
-        },
+          lastViewedAt: new Date(),
+          updatedAt: new Date()
+        }
       }
     );
 
     res.json({ ok: true });
   } catch (e) {
-    console.error("mark read error:", e);
+    console.error("mark-read error:", e);
     res.status(500).json({ ok: false });
   }
 });
+
 
 
 // Escalation endpoints (kept)
