@@ -1166,22 +1166,30 @@ function startOutboundWorker() {
 
 // ----------------- Existing APIs (conversations, escalation, faq) -----------------
 app.get("/api/conversations", async (req, res) => {
+
   const limit = Math.min(Number(req.query.limit || 50), 200);
+  const showHidden = req.query.hidden === "true";
+
+  const filter = showHidden
+    ? { hidden: true }
+    : { $or: [{ hidden: { $ne: true } }, { hidden: { $exists: false } }] };
 
   const items = await sessions
-    .find({ hidden: { $ne: true } }, {
+    .find(filter, {
       projection: {
-      userId: 1,
-      number: 1,
-      firstName: 1,
-      lastName: 1,
-      updatedAt: 1,
-      lastInboundAt: 1,
-      lastAgentAt: 1,
-      lastViewedAt: 1,
-      history: { $slice: -1 }
-    }
-    }).sort({ updatedAt: -1 })
+        userId: 1,
+        number: 1,
+        firstName: 1,
+        lastName: 1,
+        updatedAt: 1,
+        lastInboundAt: 1,
+        lastAgentAt: 1,
+        lastViewedAt: 1,
+        hidden: 1,
+        history: { $slice: -1 }
+      }
+    })
+    .sort({ updatedAt: -1 })
     .limit(limit)
     .toArray();
 
