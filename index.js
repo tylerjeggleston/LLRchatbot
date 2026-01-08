@@ -1222,6 +1222,29 @@ app.post("/api/conversations/:userId/send", async (req, res) => {
   res.json({ ok: true });
 });
 
+// Mark conversation as read (on open)
+app.post("/api/conversations/:userId/read", async (req, res) => {
+  try {
+    const userId = req.params.userId;
+
+    await sessions.updateOne(
+      { userId },
+      {
+        $set: {
+          lastAgentAt: new Date(), // 👈 THIS IS THE KEY
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("mark read error:", e);
+    res.status(500).json({ ok: false });
+  }
+});
+
+
 // Escalation endpoints (kept)
 app.get("/api/escalation/keywords", requireAdmin, async (req, res) => {
   const items = await escalationKeywords.find({}).sort({ keyword: 1 }).toArray();
