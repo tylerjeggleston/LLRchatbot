@@ -796,16 +796,16 @@ function startReplyWorker() {
 
 // ----------------- Bulk Outbound API + Worker -----------------
 
-// GET /api/inbox/unread-count
-// GET /api/inbox/unread-count
+
+// Correct unread count (matches inbox logic)
 app.get("/api/inbox/unread-count", async (req, res) => {
   try {
     const count = await sessions.countDocuments({
       lastInboundAt: { $exists: true },
       $expr: {
-        $or: [
-          { $not: ["$lastAgentAt"] },
-          { $gt: ["$lastInboundAt", "$lastAgentAt"] }
+        $gt: [
+          "$lastInboundAt",
+          { $ifNull: ["$lastViewedAt", "$lastAgentAt"] }
         ]
       }
     });
