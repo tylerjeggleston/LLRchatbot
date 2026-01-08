@@ -849,26 +849,32 @@ app.post("/api/outbound/template", requireAdmin, async (req, res) => {
 });
 
 // GET /api/inbox/stats
+// GET /api/inbox/stats
 app.get("/api/inbox/stats", async (req, res) => {
   try {
     const agg = await sessions.aggregate([
       {
         $project: {
+          hasInbound: {
+            $gt: [
+              {
+                $size: {
+                  $filter: {
+                    input: "$history",
+                    as: "m",
+                    cond: { $eq: ["$$m.role", "user"] }
+                  }
+                }
+              },
+              0
+            ]
+          },
           outboundCount: {
             $size: {
               $filter: {
                 input: "$history",
                 as: "m",
                 cond: { $eq: ["$$m.role", "assistant"] }
-              }
-            }
-          },
-          inboundCount: {
-            $size: {
-              $filter: {
-                input: "$history",
-                as: "m",
-                cond: { $eq: ["$$m.role", "user"] }
               }
             }
           }
@@ -878,22 +884,27 @@ app.get("/api/inbox/stats", async (req, res) => {
         $group: {
           _id: null,
           outbound: { $sum: "$outboundCount" },
-          inbound: { $sum: "$inboundCount" }
+          customersReplied: {
+            $sum: {
+              $cond: ["$hasInbound", 1, 0]
+            }
+          }
         }
       }
     ]).toArray();
 
-    const row = agg[0] || { outbound: 0, inbound: 0 };
+    const row = agg[0] || { outbound: 0, customersReplied: 0 };
 
     res.json({
       outbound: row.outbound,
-      inbound: row.inbound
+      customersReplied: row.customersReplied
     });
   } catch (e) {
     console.error("stats error:", e);
-    res.json({ outbound: 0, inbound: 0 });
+    res.json({ outbound: 0, customersReplied: 0 });
   }
 });
+
 
 
 // Create batch: frontend posts rows JSON parsed from CSV
