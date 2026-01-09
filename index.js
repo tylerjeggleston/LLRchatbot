@@ -361,24 +361,68 @@ async function getOverallGoal() {
 //   );
 // }
 
-async function sendEscalationAlerts({ userId, from, text, matchedKeywords }) {
+// async function sendEscalationAlerts({ userId, from, text, matchedKeywords }) {
+//   const cfg = await getEscalationConfig();
+//   if (!matchedKeywords.length || !cfg.targets.length) return;
+
+//   const session = await sessions.findOne(
+//     { userId },
+//     { projection: { firstName: 1, lastName: 1, history: { $slice: -30 },  } }
+//   );
+
+//   const firstName = String(session?.firstName || "").trim();
+//   const lastName = String(session?.lastName || "").trim();
+//   const fullName = `${firstName} ${lastName}`.trim() || "Unknown";
+
+//   const history = session?.history || [];
+//   const lastOutbound = [...history].reverse().find((m) => m?.role === "assistant" || m?.role === "agent");
+//   const previousMessage = lastOutbound?.content
+//     ? String(lastOutbound.content).slice(0, 500)
+//     : "(no previous outbound message found)";
+
+//   const msg =
+//     `🚨 Keyword alert: ${matchedKeywords.join(", ")}\n` +
+//     `From: ${from}\n` +
+//     `Name: ${fullName}\n` +
+//     `Previous: ${previousMessage}\n` +
+//     `Reply: ${String(text).slice(0, 500)}`;
+
+//   await Promise.all(
+//     cfg.targets.map((targetNumber) =>
+//       notificationapi.send({
+//         type: "ai_sms_chat",
+//         to: { id: normalizeUserIdFromPhone(targetNumber), number: targetNumber },
+//         sms: { message: msg },
+//       })
+//     )
+//   );
+
+// }
+
+async function sendEscalationAlerts({ userId, from, text, matchedKeywords, inboundFirstName, inboundLastName }) {
   const cfg = await getEscalationConfig();
-  if (!matchedKeywords.length || !cfg.targets.length) return;
+  if (!matchedKeywords.length) return;
 
   const session = await sessions.findOne(
     { userId },
-    { projection: { firstName: 1, lastName: 1, history: { $slice: -30 },  } }
+    { projection: { firstName: 1, lastName: 1, history: { $slice: -30 }, assignedTarget: 1 } }
   );
 
-  const firstName = String(session?.firstName || "").trim();
-  const lastName = String(session?.lastName || "").trim();
+  const firstName =
+    String(inboundFirstName || session?.firstName || "").trim();
+  const lastName =
+    String(inboundLastName || session?.lastName || "").trim();
+
   const fullName = `${firstName} ${lastName}`.trim() || "Unknown";
 
   const history = session?.history || [];
-  const lastOutbound = [...history].reverse().find((m) => m?.role === "assistant" || m?.role === "agent");
+  const lastOutbound = [...history].reverse().find(
+    m => m?.role === "assistant" || m?.role === "agent"
+  );
+
   const previousMessage = lastOutbound?.content
     ? String(lastOutbound.content).slice(0, 500)
-    : "(no previous outbound message found)";
+    : "(no previous outbound message)";
 
   const msg =
     `🚨 Keyword alert: ${matchedKeywords.join(", ")}\n` +
@@ -387,16 +431,31 @@ async function sendEscalationAlerts({ userId, from, text, matchedKeywords }) {
     `Previous: ${previousMessage}\n` +
     `Reply: ${String(text).slice(0, 500)}`;
 
-  await Promise.all(
-    cfg.targets.map((targetNumber) =>
-      notificationapi.send({
-        type: "ai_sms_chat",
-        to: { id: normalizeUserIdFromPhone(targetNumber), number: targetNumber },
-        sms: { message: msg },
-      })
-    )
-  );
+  const targetsToNotify = [];
+
+if (session?.assignedTarget?.number) {
+  targetsToNotify.push(session.assignedTarget);
+} else {
+  // fallback only if you WANT global alerts
+  cfg.targets.forEach(number => {
+    targetsToNotify.push({ number, name: "Escalation Target" });
+  });
 }
+
+await Promise.all(
+  targetsToNotify.map(t =>
+    notificationapi.send({
+      type: "ai_sms_chat",
+      to: {
+        id: normalizeUserIdFromPhone(t.number),
+        number: t.number
+      },
+      sms: { message: msg }
+    })
+  )
+);
+}
+
 
 
 
@@ -670,7 +729,9 @@ app.post("/webhook/notificationapi/sms", async (req, res) => {
           userId,
           from,
           text,
-          matchedKeywords: matched
+          matchedKeywords: matched,
+          inboundFirstName: firstName,
+          inboundLastName: lastName
         });
       } catch (error) {
         console.error("Escalation alert error:", error?.message || error);
