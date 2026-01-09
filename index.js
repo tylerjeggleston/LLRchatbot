@@ -467,8 +467,6 @@ await Promise.all(
 }
 
 
-
-
 // ---------- FAQ helpers ----------
 async function fetchRelevantFaqs(queryText, limit = 5) {
   try {
@@ -632,10 +630,16 @@ app.post("/webhook/notificationapi/sms", async (req, res) => {
       await dncEvents.insertOne({
         userId,
         from,
+
+        // ✅ STORE NAME FOR REPORTING UI
+        firstName: String(firstName || "").trim(),
+        lastName: String(lastName || "").trim(),
+
         keyword: matchedDnc.keyword,
         text,
         createdAt: new Date()
-      });
+        });
+
 
       // optional carrier-safe confirmation (still commented)
       // await notificationapi.send({ ... });
@@ -955,7 +959,7 @@ app.post("/api/outbound/template", requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
-// GET /api/inbox/stats
+
 // GET /api/inbox/stats
 app.get("/api/inbox/stats", async (req, res) => {
   try {
@@ -1451,6 +1455,29 @@ app.post("/api/conversations/:userId/read", async (req, res) => {
   }
 });
 
+// List DNC Events
+app.get("/api/dnc/events", requireAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit || 200), 500);
+    const phone = String(req.query.phone || "").trim();
+    const keyword = String(req.query.keyword || "").trim().toLowerCase();
+
+    const q = {};
+    if (phone) q.from = phone;
+    if (keyword) q.keyword = keyword;
+
+    const items = await dncEvents
+      .find(q)
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .toArray();
+
+    res.json({ items });
+  } catch (e) {
+    console.error("dnc events error:", e?.message || e);
+    res.status(500).json({ error: "Failed to load DNC events" });
+  }
+});
 
 
 // Escalation endpoints (kept)
