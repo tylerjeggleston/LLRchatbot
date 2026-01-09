@@ -659,27 +659,40 @@ app.post("/webhook/notificationapi/sms", async (req, res) => {
       }
     }
 
+
     // 7. Save inbound message
+    const existing = await sessions.findOne(
+      { userId },
+      { projection: { firstName: 1, lastName: 1 } }
+    );
+
+    const inboundFirstName = String(payload.firstName || "").trim();
+    const inboundLastName = String(payload.lastName || "").trim();
+
+    const finalFirstName = inboundFirstName || String(existing?.firstName || "").trim();
+    const finalLastName = inboundLastName || String(existing?.lastName || "").trim();
+
     await sessions.updateOne(
       { userId },
       {
         $setOnInsert: { userId, createdAt: new Date() },
         $set: {
           number: from,
-          firstName,
-          lastName,
+          firstName: finalFirstName,
+          lastName: finalLastName,
           updatedAt: new Date(),
-          lastInboundAt: new Date()
+          lastInboundAt: new Date(),
         },
         $push: {
           history: {
             $each: [{ role: "user", content: text, createdAt: new Date() }],
-            $slice: -30
-          }
-        }
+            $slice: -30,
+          },
+        },
       },
       { upsert: true }
     );
+
 
     // 8. Escalation logic (unchanged)
     const cfg = await getEscalationConfig();
@@ -702,8 +715,9 @@ app.post("/webhook/notificationapi/sms", async (req, res) => {
           { projection: { firstName: 1, lastName: 1, history: { $slice: -30 } } }
         );
 
-        const firstName = String(session?.firstName || "").trim();
-        const lastName = String(session?.lastName || "").trim();
+        const firstName = String(session?.firstName || inboundFirstName || "").trim();
+        const lastName  = String(session?.lastName  || inboundLastName  || "").trim();
+
 
         const history = session?.history || [];
         const lastOutbound = [...history].reverse().find(
