@@ -193,16 +193,6 @@ function assertE164(number) {
   }
 }
 
-async function isOptedOutUserId(userId) {
-  if (!userId) return false;
-  const doc = await sessions.findOne(
-    { userId: String(userId) },
-    { projection: { optedOut: 1 } }
-  );
-  return !!doc?.optedOut;
-}
-
-
 function normalizeToE164(input, defaultCountryCode = "1") {
   const raw = String(input || "").trim();
   if (!raw) return null;
@@ -519,16 +509,6 @@ app.post("/outbound/start", async (req, res) => {
 
     const uid = normalizeUserIdFromPhone(normalized);
 
-    const optedOut = await isOptedOutUserId(uid);
-    if (optedOut) {
-    return res.status(409).json({
-        ok: false,
-        error: "dnc_opted_out",
-        message: "This number previously opted out. Outbound blocked."
-    });
-    }
-
-
     const msg = firstMessage
       ? String(firstMessage)
       : renderTemplate(settings.template, { firstName, lastName });
@@ -599,11 +579,7 @@ app.post("/webhook/notificationapi/sms", async (req, res) => {
 
     // 3. Keyword-based DNC (admin-defined)
     const dnc = await dncKeywords.find({ enabled: true }).toArray();
-    const matchedDnc = dnc.find(k => {
-    const kw = String(k?.keyword || "").trim().toLowerCase();
-    return kw && textLower.includes(kw);
-    });
-
+    const matchedDnc = dnc.find(k => textLower.includes(k.keyword));
 
     if (matchedDnc) {
       await sessions.updateOne(
@@ -619,12 +595,8 @@ app.post("/webhook/notificationapi/sms", async (req, res) => {
             updatedAt: new Date()
           },
           $push: {
-            history: {
-                $each: [{ role: "user", content: text, createdAt: new Date() }],
-                $slice: -30
-            }
-            }
-
+            history: { role: "user", content: text, createdAt: new Date() }
+          }
         },
         { upsert: true }
       );
@@ -658,12 +630,8 @@ app.post("/webhook/notificationapi/sms", async (req, res) => {
             updatedAt: new Date()
           },
           $push: {
-            history: {
-                $each: [{ role: "user", content: text, createdAt: new Date() }],
-                $slice: -30
-            }
-            }
-
+            history: { role: "user", content: text, createdAt: new Date() }
+          }
         },
         { upsert: true }
       );
@@ -1081,32 +1049,11 @@ app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
       rejected: 0,
       sent: 0,
       failed: 0,
-      skipped: 0,
       spacingMs,
       assignedTarget: assignedTarget || null,
       createdAt: new Date(),
       updatedAt: new Date(),
     });
-
-    // ✅ Prefetch opted-out userIds for this batch (so we can reject them fast)
-        const candidateUserIds = [];
-        for (const r of rows || []) {
-        const phoneRaw = String(r.phone || r.Phone || r.number || "").trim();
-        const e164 = normalizeToE164(phoneRaw, defaultCountryCode); // use your existing normalize
-        if (!e164) continue;
-        const uid = normalizeUserIdFromPhone(e164); // use your existing userId builder
-        candidateUserIds.push(uid);
-        }
-
-        const optedOutDocs = await sessions
-        .find(
-            { userId: { $in: candidateUserIds }, optedOut: true },
-            { projection: { userId: 1 } }
-        )
-        .toArray();
-
-        const optedOutSet = new Set(optedOutDocs.map(d => d.userId));
-
 
     const queueDocs = [];
     for (let i = 0; i < rows.length; i++) {
@@ -1123,13 +1070,6 @@ app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
       }
 
       const uid = normalizeUserIdFromPhone(e164);
-
-      if (optedOutSet.has(uid)) {
-        rejected++;
-        rejects.push({ index: i, phone: e164, reason: "dnc_opted_out" });
-        continue;
-        }
-
       const message = renderTemplate(settings.template, { firstName, lastName });
 
       const runAt = new Date(now + accepted * spacingMs); // 5s between accepted sends
@@ -1220,40 +1160,6 @@ async function processOneOutboundJob() {
   if (!job || !job._id) return false;
 
   const { batchId, userId, number, message } = job;
-
-  // 🔒 DNC guard: never send outbound to opted-out users
-const sess = await sessions.findOne(
-  { userId },
-  { projection: { optedOut: 1 } }
-);
-
-if (sess?.optedOut) {
-  // mark job skipped
-  await outboundQueue.updateOne(
-    { _id: job._id },
-    { $set: { status: "skipped_dnc", skippedAt: new Date() } }
-  );
-
-  // keep batch counters consistent
-  if (job.batchId) {
-    await outboundBatches.updateOne(
-      { _id: job.batchId },
-      { $inc: { skipped: 1 }, $set: { updatedAt: new Date() } }
-    );
-
-    // optional: close batch if finished
-    const b = await outboundBatches.findOne({ _id: job.batchId });
-    if (b && (b.sent + b.failed + (b.skipped || 0)) >= b.accepted) {
-      await outboundBatches.updateOne(
-        { _id: job.batchId },
-        { $set: { status: "done", updatedAt: new Date() } }
-      );
-    }
-  }
-
-  return true; // job consumed
-}
-
 
   try {
     // Create session + save first message
