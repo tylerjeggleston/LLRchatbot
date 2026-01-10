@@ -1345,90 +1345,157 @@ function startOutboundWorker() {
 
 // ----------------- Existing APIs (conversations, escalation, faq) -----------------
 app.get("/api/conversations", async (req, res) => {
-  const limit = Math.min(Number(req.query.limit || 200), 500);
-  const hidden = req.query.hidden === "true";
+  try {
+    const limit = Math.min(Number(req.query.limit || 200), 500);
+    const hidden = req.query.hidden === "true";
+    const onlyUnread = req.query.onlyUnread === "true";
 
-  const baseFilter = hidden ? { hidden: true } : { hidden: { $ne: true } };
+    const baseFilter = hidden ? { hidden: true } : { hidden: { $ne: true } };
 
-  let cursor = null;
-  if (req.query.cursor) {
-    try {
-      cursor = JSON.parse(Buffer.from(req.query.cursor, "base64url").toString("utf8"));
-    } catch {}
-  }
-
-  const sort = { updatedAt: -1, userId: 1 };
-
-  let filter = baseFilter;
-
-  if (cursor?.updatedAt && cursor?.userId) {
-    const dt = new Date(cursor.updatedAt);
-    filter = {
-      $and: [
-        baseFilter,
-        {
-          $or: [
-            { updatedAt: { $lt: dt } },
-            { updatedAt: dt, userId: { $gt: cursor.userId } },
-          ],
+    // ✅ If onlyUnread=true, ignore cursor and return unread-only page (sorted by inbound)
+    // This is used by frontend to pin ALL unread at the top.
+    if (onlyUnread) {
+      const filter = {
+        ...baseFilter,
+        lastInboundAt: { $ne: null },
+        $expr: {
+          $gt: ["$lastInboundAt", { $ifNull: ["$lastViewedAt", "$lastAgentAt"] }],
         },
-      ],
-    };
-  }
-
-  const docs = await sessions
-    .find(filter, {
-      projection: {
-        userId: 1,
-        number: 1,
-        firstName: 1,
-        lastName: 1,
-        updatedAt: 1,
-        assignedTarget: 1,
-        lastInboundAt: 1,
-        lastAgentAt: 1,
-        lastViewedAt: 1,
-        hidden: 1,
-        history: { $slice: -1 },
-      },
-    })
-    .sort(sort)
-    .limit(limit + 1)
-    .toArray();
-
-  const hasMore = docs.length > limit;
-  const page = docs.slice(0, limit);
-
-  const nextCursor = hasMore && page.length
-    ? Buffer.from(JSON.stringify({
-        updatedAt: page[page.length - 1].updatedAt,
-        userId: page[page.length - 1].userId,
-      }), "utf8").toString("base64url")
-    : null;
-
-  res.json({
-    items: page.map((d) => {
-      const lastSeen = d.lastViewedAt || d.lastAgentAt;
-      const unread =
-        d.lastInboundAt && (!lastSeen || new Date(d.lastInboundAt) > new Date(lastSeen));
-
-      return {
-        userId: d.userId,
-        number: d.number,
-        firstName: d.firstName || "",
-        lastName: d.lastName || "",
-        assignedTarget: d.assignedTarget || null,
-        updatedAt: d.updatedAt,
-        lastMessage: d.history?.[0]?.content || "",
-        lastRole: d.history?.[0]?.role || "",
-        unread,
-        hidden: !!d.hidden,
       };
-    }),
-    nextCursor,
-    hasMore,
-  });
+
+      const docs = await sessions
+        .find(filter, {
+          projection: {
+            userId: 1,
+            number: 1,
+            firstName: 1,
+            lastName: 1,
+            updatedAt: 1,
+            assignedTarget: 1,
+            lastInboundAt: 1,
+            lastAgentAt: 1,
+            lastViewedAt: 1,
+            hidden: 1,
+            history: { $slice: -1 },
+          },
+        })
+        .sort({ lastInboundAt: -1, updatedAt: -1, userId: 1 })
+        .limit(limit)
+        .toArray();
+
+      return res.json({
+        items: docs.map((d) => {
+          const lastSeen = d.lastViewedAt || d.lastAgentAt;
+          const unread =
+            d.lastInboundAt && (!lastSeen || new Date(d.lastInboundAt) > new Date(lastSeen));
+
+          return {
+            userId: d.userId,
+            number: d.number,
+            firstName: d.firstName || "",
+            lastName: d.lastName || "",
+            assignedTarget: d.assignedTarget || null,
+            updatedAt: d.updatedAt,
+            lastMessage: d.history?.[0]?.content || "",
+            lastRole: d.history?.[0]?.role || "",
+            unread,
+            hidden: !!d.hidden,
+          };
+        }),
+      });
+    }
+
+    // ✅ Existing cursor pagination path (UNCHANGED)
+    let cursor = null;
+    if (req.query.cursor) {
+      try {
+        cursor = JSON.parse(
+          Buffer.from(req.query.cursor, "base64url").toString("utf8")
+        );
+      } catch {}
+    }
+
+    const sort = { updatedAt: -1, userId: 1 };
+
+    let filter = baseFilter;
+
+    if (cursor?.updatedAt && cursor?.userId) {
+      const dt = new Date(cursor.updatedAt);
+      filter = {
+        $and: [
+          baseFilter,
+          {
+            $or: [
+              { updatedAt: { $lt: dt } },
+              { updatedAt: dt, userId: { $gt: cursor.userId } },
+            ],
+          },
+        ],
+      };
+    }
+
+    const docs = await sessions
+      .find(filter, {
+        projection: {
+          userId: 1,
+          number: 1,
+          firstName: 1,
+          lastName: 1,
+          updatedAt: 1,
+          assignedTarget: 1,
+          lastInboundAt: 1,
+          lastAgentAt: 1,
+          lastViewedAt: 1,
+          hidden: 1,
+          history: { $slice: -1 },
+        },
+      })
+      .sort(sort)
+      .limit(limit + 1)
+      .toArray();
+
+    const hasMore = docs.length > limit;
+    const page = docs.slice(0, limit);
+
+    const nextCursor =
+      hasMore && page.length
+        ? Buffer.from(
+            JSON.stringify({
+              updatedAt: page[page.length - 1].updatedAt,
+              userId: page[page.length - 1].userId,
+            }),
+            "utf8"
+          ).toString("base64url")
+        : null;
+
+    res.json({
+      items: page.map((d) => {
+        const lastSeen = d.lastViewedAt || d.lastAgentAt;
+        const unread =
+          d.lastInboundAt && (!lastSeen || new Date(d.lastInboundAt) > new Date(lastSeen));
+
+        return {
+          userId: d.userId,
+          number: d.number,
+          firstName: d.firstName || "",
+          lastName: d.lastName || "",
+          assignedTarget: d.assignedTarget || null,
+          updatedAt: d.updatedAt,
+          lastMessage: d.history?.[0]?.content || "",
+          lastRole: d.history?.[0]?.role || "",
+          unread,
+          hidden: !!d.hidden,
+        };
+      }),
+      nextCursor,
+      hasMore,
+    });
+  } catch (e) {
+    console.error("GET /api/conversations error:", e);
+    res.status(500).json({ error: "Failed to load conversations" });
+  }
 });
+
 
 
 app.get("/api/conversations/:userId", async (req, res) => {
