@@ -130,6 +130,8 @@ async function initDb() {
   await dncKeywords.createIndex({ enabled: 1 });
 
   await dncEvents.createIndex({ userId: 1, createdAt: -1 });
+  await sessions.createIndex({ hidden: 1, updatedAt: -1, userId: 1 });
+
 
   console.log("✅ Mongo connected");
 
@@ -1339,15 +1341,38 @@ function startOutboundWorker() {
 
 // ----------------- Existing APIs (conversations, escalation, faq) -----------------
 app.get("/api/conversations", async (req, res) => {
+  const limit = Math.min(Number(req.query.limit || 200), 500);
+  const hidden = req.query.hidden === "true";
 
-  const limit = Math.min(Number(req.query.limit || 5000), 200);
-  const showHidden = req.query.hidden === "true";
+  const baseFilter = hidden ? { hidden: true } : { hidden: { $ne: true } };
 
-  const filter = showHidden
-    ? { hidden: true }
-    : { $or: [{ hidden: { $ne: true } }, { hidden: { $exists: false } }] };
+  let cursor = null;
+  if (req.query.cursor) {
+    try {
+      cursor = JSON.parse(Buffer.from(req.query.cursor, "base64url").toString("utf8"));
+    } catch {}
+  }
 
-  const items = await sessions
+  const sort = { updatedAt: -1, userId: 1 };
+
+  let filter = baseFilter;
+
+  if (cursor?.updatedAt && cursor?.userId) {
+    const dt = new Date(cursor.updatedAt);
+    filter = {
+      $and: [
+        baseFilter,
+        {
+          $or: [
+            { updatedAt: { $lt: dt } },
+            { updatedAt: dt, userId: { $gt: cursor.userId } },
+          ],
+        },
+      ],
+    };
+  }
+
+  const docs = await sessions
     .find(filter, {
       projection: {
         userId: 1,
@@ -1360,37 +1385,47 @@ app.get("/api/conversations", async (req, res) => {
         lastAgentAt: 1,
         lastViewedAt: 1,
         hidden: 1,
-        history: { $slice: -1 }
-      }
+        history: { $slice: -1 },
+      },
     })
-    .sort({ updatedAt: -1 })
-    .limit(limit)
+    .sort(sort)
+    .limit(limit + 1)
     .toArray();
 
+  const hasMore = docs.length > limit;
+  const page = docs.slice(0, limit);
+
+  const nextCursor = hasMore && page.length
+    ? Buffer.from(JSON.stringify({
+        updatedAt: page[page.length - 1].updatedAt,
+        userId: page[page.length - 1].userId,
+      }), "utf8").toString("base64url")
+    : null;
+
   res.json({
-    items: items.map((d) => {
- const lastSeen = d.lastViewedAt || d.lastAgentAt;
+    items: page.map((d) => {
+      const lastSeen = d.lastViewedAt || d.lastAgentAt;
+      const unread =
+        d.lastInboundAt && (!lastSeen || new Date(d.lastInboundAt) > new Date(lastSeen));
 
-const unread =
-  d.lastInboundAt &&
-  (!lastSeen || new Date(d.lastInboundAt) > new Date(lastSeen));
-
-
-  return {
-  userId: d.userId,
-  number: d.number,
-  firstName: d.firstName || "",
-  lastName: d.lastName || "",
-  assignedTarget: d.assignedTarget || null,
-  updatedAt: d.updatedAt,
-  lastMessage: d.history?.[0]?.content || "",
-  lastRole: d.history?.[0]?.role || "",
-  unread,
-  hidden: !!d.hidden
-};
-  }),
+      return {
+        userId: d.userId,
+        number: d.number,
+        firstName: d.firstName || "",
+        lastName: d.lastName || "",
+        assignedTarget: d.assignedTarget || null,
+        updatedAt: d.updatedAt,
+        lastMessage: d.history?.[0]?.content || "",
+        lastRole: d.history?.[0]?.role || "",
+        unread,
+        hidden: !!d.hidden,
+      };
+    }),
+    nextCursor,
+    hasMore,
   });
 });
+
 
 app.get("/api/conversations/:userId", async (req, res) => {
   const doc = await sessions.findOne({ userId: req.params.userId });
@@ -1590,12 +1625,22 @@ app.post("/api/dnc/keywords", requireAdmin, async (req, res) => {
 
   await dncKeywords.updateOne(
     { keyword },
-    { $setOnInsert: { keyword, enabled: true, createdAt: new Date() } },
+    {
+      $set: {
+        keyword,
+        enabled: true,
+        updatedAt: new Date(),
+      },
+      $setOnInsert: {
+        createdAt: new Date(),
+      },
+    },
     { upsert: true }
   );
 
   res.json({ ok: true });
 });
+
 
 app.get("/api/targets", async (req, res) => {
   try {
@@ -1615,16 +1660,20 @@ app.get("/api/targets", async (req, res) => {
 
 
 app.patch("/api/dnc/keywords/:keyword", requireAdmin, async (req, res) => {
-  const keyword = decodeURIComponent(req.params.keyword);
-  const enabled = Boolean(req.body?.enabled);
+  const keyword = decodeURIComponent(req.params.keyword).trim().toLowerCase();
+
+  if (typeof req.body?.enabled !== "boolean") {
+    return res.status(400).json({ error: "enabled_boolean_required" });
+  }
 
   await dncKeywords.updateOne(
     { keyword },
-    { $set: { enabled, updatedAt: new Date() } }
+    { $set: { enabled: req.body.enabled, updatedAt: new Date() } }
   );
 
   res.json({ ok: true });
 });
+
 
 
 app.delete("/api/dnc/keywords/:keyword", requireAdmin, async (req, res) => {
