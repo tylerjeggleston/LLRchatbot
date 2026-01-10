@@ -720,6 +720,10 @@ app.post("/webhook/notificationapi/sms", async (req, res) => {
           lastName: finalLastName,
           updatedAt: new Date(),
           lastInboundAt: new Date(),
+          hidden: false,
+          hiddenAt: null,
+          unhiddenAt: new Date(),
+          unhiddenReason: "inbound_reply",
         },
         $push: {
           history: {
