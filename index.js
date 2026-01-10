@@ -1340,7 +1340,7 @@ function startOutboundWorker() {
 // ----------------- Existing APIs (conversations, escalation, faq) -----------------
 app.get("/api/conversations", async (req, res) => {
 
-  const limit = Math.min(Number(req.query.limit || 50), 200);
+  const limit = Math.min(Number(req.query.limit || 5000), 200);
   const showHidden = req.query.hidden === "true";
 
   const filter = showHidden
