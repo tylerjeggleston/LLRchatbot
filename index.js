@@ -563,30 +563,6 @@ app.post("/outbound/start", async (req, res) => {
   }
 });
 
-app.post("/api/conversations/read-all", async (req, res) => {
-  try {
-    const now = new Date();
-
-    // same unread definition used by /api/conversations?onlyUnread=true
-    const filter = {
-      hidden: { $ne: true },
-      lastInboundAt: { $exists: true, $ne: null },
-      $expr: {
-        $gt: ["$lastInboundAt", { $ifNull: ["$lastViewedAt", "$lastAgentAt"] }],
-      },
-    };
-
-    const r = await sessions.updateMany(filter, {
-      $set: { lastViewedAt: now, updatedAt: now },
-    });
-
-    res.json({ ok: true, modified: r.modifiedCount });
-  } catch (e) {
-    console.error("read-all error:", e);
-    res.status(500).json({ error: e?.message || "Failed to mark all read" });
-  }
-});
-
 // ----------------- INBOUND WEBHOOK -----------------
 app.post("/webhook/notificationapi/sms", async (req, res) => {
   try {
@@ -1520,25 +1496,27 @@ app.get("/api/conversations", async (req, res) => {
   }
 });
 
-app.post("/api/conversations/read-all", requireAuth, async (req, res) => {
+// Mark ALL conversations as read (uses the same unread logic you already use everywhere)
+app.post("/api/conversations/read-all", async (req, res) => {
   try {
-    const _db = await mongo();
+    const now = new Date();
 
-    // adjust collection name to yours
-    const conversations = _db.collection("conversations");
+    // same unread definition used by /api/conversations?onlyUnread=true
+    const filter = {
+      hidden: { $ne: true },
+      lastInboundAt: { $exists: true, $ne: null },
+      $expr: {
+        $gt: ["$lastInboundAt", { $ifNull: ["$lastViewedAt", "$lastAgentAt"] }],
+      },
+    };
 
-    // If you have owner/client scoping, APPLY IT HERE.
-    // Example: const ownerId = req.user.id;
-    // const filter = { ownerId, hidden: { $ne: true }, unread: true };
-
-    const filter = { hidden: { $ne: true }, unread: true };
-
-    const r = await conversations.updateMany(filter, {
-      $set: { unread: false, updatedAt: new Date() },
+    const r = await sessions.updateMany(filter, {
+      $set: { lastViewedAt: now, updatedAt: now },
     });
 
     res.json({ ok: true, modified: r.modifiedCount });
   } catch (e) {
+    console.error("read-all error:", e);
     res.status(500).json({ error: e?.message || "Failed to mark all read" });
   }
 });
