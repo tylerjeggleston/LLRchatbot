@@ -1496,6 +1496,28 @@ app.get("/api/conversations", async (req, res) => {
   }
 });
 
+app.post("/api/conversations/read-all", requireAuth, async (req, res) => {
+  try {
+    const _db = await mongo();
+
+    // adjust collection name to yours
+    const conversations = _db.collection("conversations");
+
+    // If you have owner/client scoping, APPLY IT HERE.
+    // Example: const ownerId = req.user.id;
+    // const filter = { ownerId, hidden: { $ne: true }, unread: true };
+
+    const filter = { hidden: { $ne: true }, unread: true };
+
+    const r = await conversations.updateMany(filter, {
+      $set: { unread: false, updatedAt: new Date() },
+    });
+
+    res.json({ ok: true, modified: r.modifiedCount });
+  } catch (e) {
+    res.status(500).json({ error: e?.message || "Failed to mark all read" });
+  }
+});
 
 
 app.get("/api/conversations/:userId", async (req, res) => {
