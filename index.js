@@ -563,6 +563,30 @@ app.post("/outbound/start", async (req, res) => {
   }
 });
 
+app.post("/api/conversations/read-all", async (req, res) => {
+  try {
+    const now = new Date();
+
+    // same unread definition used by /api/conversations?onlyUnread=true
+    const filter = {
+      hidden: { $ne: true },
+      lastInboundAt: { $exists: true, $ne: null },
+      $expr: {
+        $gt: ["$lastInboundAt", { $ifNull: ["$lastViewedAt", "$lastAgentAt"] }],
+      },
+    };
+
+    const r = await sessions.updateMany(filter, {
+      $set: { lastViewedAt: now, updatedAt: now },
+    });
+
+    res.json({ ok: true, modified: r.modifiedCount });
+  } catch (e) {
+    console.error("read-all error:", e);
+    res.status(500).json({ error: e?.message || "Failed to mark all read" });
+  }
+});
+
 // ----------------- INBOUND WEBHOOK -----------------
 app.post("/webhook/notificationapi/sms", async (req, res) => {
   try {
