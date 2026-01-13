@@ -1256,6 +1256,38 @@ app.get("/api/escalation/events", async (req, res) => {
   }
 });
 
+// Save/update a note on an escalation event
+app.patch("/api/escalation/events/:id/note", requireAdmin, async (req, res) => {
+  try {
+    const id = String(req.params.id || "").trim();
+    if (!id) return res.status(400).json({ error: "id_required" });
+
+    const noteRaw = req.body?.note;
+    const note = noteRaw === null || noteRaw === undefined ? "" : String(noteRaw);
+
+    // keep it sane
+    if (note.length > 2000) return res.status(400).json({ error: "note_too_long" });
+
+    const _id = new ObjectId(id);
+
+    const r = await escalationEvents.updateOne(
+      { _id },
+      {
+        $set: {
+          note,
+          noteUpdatedAt: new Date(),
+        },
+      }
+    );
+
+    if (!r.matchedCount) return res.status(404).json({ error: "not_found" });
+
+    res.json({ ok: true, _id: id, note });
+  } catch (e) {
+    console.error("PATCH /api/escalation/events/:id/note error:", e?.message || e);
+    res.status(500).json({ error: "failed_to_save_note" });
+  }
+});
 
 
 // Batch progress
