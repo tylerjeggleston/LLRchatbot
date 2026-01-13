@@ -754,7 +754,7 @@ app.post("/webhook/notificationapi/sms", async (req, res) => {
       try {
         const session = await sessions.findOne(
           { userId },
-          { projection: { firstName: 1, lastName: 1, history: { $slice: -30 } } }
+          { projection: { firstName: 1, lastName: 1, history: { $slice: -30 }, assignedTarget: 1 } }
         );
 
         const firstName = String(session?.firstName || inboundFirstName || "").trim();
@@ -771,16 +771,21 @@ app.post("/webhook/notificationapi/sms", async (req, res) => {
           : "";
 
         await escalationEvents.insertOne({
-          createdAt: new Date(),
-          from,
-          firstName,
-          lastName,
-          matchedKeywords: matched,
-          triggerText: String(text).slice(0, 800),
-          previousAssistantMessage,
-          alertedTargets: cfg.targets || [],
-          assignedTarget: session?.assignedTarget || null,
-        });
+  createdAt: new Date(),
+  from,
+  firstName,
+  lastName,
+  matchedKeywords: matched,
+  triggerText: String(text).slice(0, 800),
+  previousAssistantMessage,
+
+  // keep if you want audit trail (optional)
+  alertedTargets: cfg.targets || [],
+
+  // ✅ THIS is the rep assignment snapshot
+  assignedTarget: session?.assignedTarget || null,
+});
+
 
         await sendEscalationAlerts({
           userId,
@@ -1190,62 +1195,65 @@ app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
 });
 
 app.get("/api/escalation/events", async (req, res) => {
-  const limit = Math.min(Number(req.query.limit || 200), 500);
+  try {
+    const limit = Math.min(Number(req.query.limit || 200), 500);
 
-  const phone = String(req.query.phone || "").trim();
-  const keyword = String(req.query.keyword || "").trim().toLowerCase();
+    const phone = String(req.query.phone || "").trim();
+    const keyword = String(req.query.keyword || "").trim().toLowerCase();
 
-  const q = {};
-  if (phone) q.from = phone;
-  if (keyword) q.matchedKeywords = keyword;
+    const q = {};
+    if (phone) q.from = phone;
 
-  const items = await escalationEvents
-    .find(q)
-    .sort({ createdAt: -1 })
-    .limit(limit)
-    .toArray();
+    // matchedKeywords is an array; match by element
+    if (keyword) q.matchedKeywords = keyword;
 
-  // ✅ Build a lookup map from escalationTargets (number -> {name, number})
-  // Only needed for events that DON'T have assignedTarget snapshot.
-  const needNumbers = new Set();
-  for (const ev of items) {
-    if (ev?.assignedTarget?.number) continue;
-    for (const n of ev?.alertedTargets || []) needNumbers.add(String(n));
-  }
-
-  let targetMap = new Map();
-  if (needNumbers.size) {
-    const targetDocs = await escalationTargets
-      .find({ number: { $in: Array.from(needNumbers) } }, { projection: { name: 1, number: 1 } })
+    const items = await escalationEvents
+      .find(q)
+      .sort({ createdAt: -1 })
+      .limit(limit)
       .toArray();
 
-    targetMap = new Map(targetDocs.map((t) => [String(t.number), { name: t.name, number: t.number }]));
-  }
-
-  const enriched = items.map((ev) => {
-    // ✅ If assignedTarget exists, that’s the “owner”
-    if (ev?.assignedTarget?.number) {
-      return {
-        ...ev,
-        targetsDetailed: [
-          {
-            name: ev.assignedTarget.name || "Target",
-            number: ev.assignedTarget.number,
-          },
-        ],
-      };
+    // ✅ Collect assignedTarget numbers that need name lookup
+    const needNumbers = new Set();
+    for (const ev of items) {
+      const n = ev?.assignedTarget?.number;
+      if (n && !ev?.assignedTarget?.name) needNumbers.add(String(n));
     }
 
-    // Otherwise use the config-based alertedTargets list (numbers), enriched from DB if possible
-    const targetsDetailed = (ev.alertedTargets || []).map((n) => {
-      const key = String(n);
-      return targetMap.get(key) || { name: "Target", number: key };
+    // Lookup missing names from Escalation_Targets
+    let targetMap = new Map();
+    if (needNumbers.size) {
+      const targetDocs = await escalationTargets
+        .find(
+          { number: { $in: Array.from(needNumbers) } },
+          { projection: { _id: 0, name: 1, number: 1 } }
+        )
+        .toArray();
+
+      targetMap = new Map(targetDocs.map(t => [String(t.number), t.name]));
+    }
+
+    // ✅ Return a single field the frontend can render: assignedTargetDetailed
+    const enriched = items.map((ev) => {
+      const num = ev?.assignedTarget?.number ? String(ev.assignedTarget.number) : "";
+      const name =
+        (ev?.assignedTarget?.name && String(ev.assignedTarget.name).trim()) ||
+        (num ? targetMap.get(num) : "") ||
+        "";
+
+      return {
+        ...ev,
+        assignedTargetDetailed: num
+          ? { name: name || "—", number: num }
+          : null,
+      };
     });
 
-    return { ...ev, targetsDetailed };
-  });
-
-  res.json({ items: enriched });
+    res.json({ items: enriched });
+  } catch (e) {
+    console.error("GET /api/escalation/events error:", e);
+    res.status(500).json({ error: "Failed to load events" });
+  }
 });
 
 
