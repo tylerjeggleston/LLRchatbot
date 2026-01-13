@@ -1669,6 +1669,7 @@ app.post("/api/conversations/:userId/read", async (req, res) => {
 });
 
 // List DNC Events
+// List DNC Events (ENRICH NAMES)
 app.get("/api/dnc/events", requireAdmin, async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit || 200), 500);
@@ -1685,12 +1686,68 @@ app.get("/api/dnc/events", requireAdmin, async (req, res) => {
       .limit(limit)
       .toArray();
 
-    res.json({ items });
+    // ✅ Find which rows are missing names
+    const needUserIds = new Set();
+    for (const ev of items) {
+      const hasName =
+        (String(ev?.firstName || "").trim() || String(ev?.lastName || "").trim());
+      if (hasName) continue;
+
+      const uid =
+        String(ev?.userId || "").trim() ||
+        normalizeUserIdFromPhone(ev?.from || "");
+
+      if (uid) needUserIds.add(uid);
+    }
+
+    // ✅ Lookup from sessions for missing names
+    let sessionMap = new Map();
+    if (needUserIds.size) {
+      const sess = await sessions
+        .find(
+          { userId: { $in: Array.from(needUserIds) } },
+          { projection: { _id: 0, userId: 1, firstName: 1, lastName: 1 } }
+        )
+        .toArray();
+
+      sessionMap = new Map(
+        sess.map((s) => [
+          String(s.userId),
+          {
+            firstName: String(s.firstName || "").trim(),
+            lastName: String(s.lastName || "").trim(),
+          },
+        ])
+      );
+    }
+
+    const enriched = items.map((ev) => {
+      const uid =
+        String(ev?.userId || "").trim() ||
+        normalizeUserIdFromPhone(ev?.from || "");
+
+      const fromSess = uid ? sessionMap.get(uid) : null;
+
+      const firstName =
+        String(ev?.firstName || "").trim() || String(fromSess?.firstName || "").trim();
+      const lastName =
+        String(ev?.lastName || "").trim() || String(fromSess?.lastName || "").trim();
+
+      return {
+        ...ev,
+        userId: uid || ev.userId,
+        firstName,
+        lastName,
+      };
+    });
+
+    res.json({ items: enriched });
   } catch (e) {
     console.error("dnc events error:", e?.message || e);
     res.status(500).json({ error: "Failed to load DNC events" });
   }
 });
+
 
 
 // Escalation endpoints (kept)
