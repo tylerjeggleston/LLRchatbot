@@ -651,32 +651,51 @@ app.post("/webhook/notificationapi/sms", async (req, res) => {
 
 
     // 4. Carrier STOP words (persist them too)
-    if (["STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"].includes(upper)) {
-      await sessions.updateOne(
-        { userId },
-        {
-          $set: {
-            userId,
-            number: from,
-            firstName,
-            lastName,
-            optedOut: true,
-            optedOutAt: new Date(),
-            updatedAt: new Date()
-          },
-          $push: {
-            history: {
-                $each: [{ role: "user", content: text, createdAt: new Date() }],
-                $slice: -30
-            }
-            }
+if (["STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"].includes(upper)) {
+  const inboundFirst = String(firstName || "").trim();
+  const inboundLast = String(lastName || "").trim();
 
+  const finalFirstName =
+    inboundFirst || String(existingSession?.firstName || "").trim();
+  const finalLastName =
+    inboundLast || String(existingSession?.lastName || "").trim();
+
+  await sessions.updateOne(
+    { userId },
+    {
+      $set: {
+        userId,
+        number: from,
+        firstName: finalFirstName,
+        lastName: finalLastName,
+        optedOut: true,
+        optedOutAt: new Date(),
+        updatedAt: new Date(),
+      },
+      $push: {
+        history: {
+          $each: [{ role: "user", content: text, createdAt: new Date() }],
+          $slice: -30,
         },
-        { upsert: true }
-      );
+      },
+    },
+    { upsert: true }
+  );
 
-      return res.status(200).json({ ok: true, opted_out: true });
-    }
+  // ✅ ALSO log into DNC_Events so the table always reflects opt-outs
+  await dncEvents.insertOne({
+    userId,
+    from,
+    firstName: finalFirstName,
+    lastName: finalLastName,
+    keyword: upper.toLowerCase(), // "stop", "unsubscribe", etc
+    text,
+    createdAt: new Date(),
+  });
+
+  return res.status(200).json({ ok: true, opted_out: true });
+}
+
 
     // 5. Emoji-only ignore
     if (isEmojiOnly(text)) {
@@ -1693,9 +1712,8 @@ app.get("/api/dnc/events", requireAdmin, async (req, res) => {
         (String(ev?.firstName || "").trim() || String(ev?.lastName || "").trim());
       if (hasName) continue;
 
-      const uid =
-        String(ev?.userId || "").trim() ||
-        normalizeUserIdFromPhone(ev?.from || "");
+      const uid = normalizeUserIdFromPhone(ev?.from || "");
+
 
       if (uid) needUserIds.add(uid);
     }
@@ -1722,9 +1740,8 @@ app.get("/api/dnc/events", requireAdmin, async (req, res) => {
     }
 
     const enriched = items.map((ev) => {
-      const uid =
-        String(ev?.userId || "").trim() ||
-        normalizeUserIdFromPhone(ev?.from || "");
+      const uid = normalizeUserIdFromPhone(ev?.from || "");
+
 
       const fromSess = uid ? sessionMap.get(uid) : null;
 
