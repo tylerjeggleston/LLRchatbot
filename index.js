@@ -605,49 +605,50 @@ app.post("/webhook/notificationapi/sms", async (req, res) => {
     });
 
 
-    if (matchedDnc) {
-      await sessions.updateOne(
-        { userId },
-        {
-          $set: {
-            userId,
-            number: from,
-            firstName,
-            lastName,
-            optedOut: true,
-            optedOutAt: new Date(),
-            updatedAt: new Date()
-          },
-          $push: {
-            history: {
-                $each: [{ role: "user", content: text, createdAt: new Date() }],
-                $slice: -30
-            }
-            }
+   if (matchedDnc) {
+  const inboundFirst = String(firstName || "").trim();
+  const inboundLast = String(lastName || "").trim();
 
-        },
-        { upsert: true }
-      );
+  const finalFirstName =
+    inboundFirst || String(existingSession?.firstName || "").trim();
+  const finalLastName =
+    inboundLast || String(existingSession?.lastName || "").trim();
 
-      await dncEvents.insertOne({
+  await sessions.updateOne(
+    { userId },
+    {
+      $set: {
         userId,
-        from,
+        number: from,
+        firstName: finalFirstName,
+        lastName: finalLastName,
+        optedOut: true,
+        optedOutAt: new Date(),
+        updatedAt: new Date(),
+      },
+      $push: {
+        history: {
+          $each: [{ role: "user", content: text, createdAt: new Date() }],
+          $slice: -30,
+        },
+      },
+    },
+    { upsert: true }
+  );
 
-        // ✅ STORE NAME FOR REPORTING UI
-        firstName: String(firstName || "").trim(),
-        lastName: String(lastName || "").trim(),
+  await dncEvents.insertOne({
+    userId,
+    from,
+    firstName: finalFirstName,
+    lastName: finalLastName,
+    keyword: String(matchedDnc.keyword || "").trim().toLowerCase(),
+    text,
+    createdAt: new Date(),
+  });
 
-        keyword: matchedDnc.keyword,
-        text,
-        createdAt: new Date()
-        });
+  return res.status(200).json({ ok: true, opted_out: true });
+}
 
-
-      // optional carrier-safe confirmation (still commented)
-      // await notificationapi.send({ ... });
-
-      return res.status(200).json({ ok: true, opted_out: true });
-    }
 
     // 4. Carrier STOP words (persist them too)
     if (["STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"].includes(upper)) {
