@@ -778,7 +778,8 @@ app.post("/webhook/notificationapi/sms", async (req, res) => {
           matchedKeywords: matched,
           triggerText: String(text).slice(0, 800),
           previousAssistantMessage,
-          alertedTargets: cfg.targets || []
+          alertedTargets: cfg.targets || [],
+          assignedTarget: session?.assignedTarget || null,
         });
 
         await sendEscalationAlerts({
@@ -1204,8 +1205,49 @@ app.get("/api/escalation/events", async (req, res) => {
     .limit(limit)
     .toArray();
 
-  res.json({ items });
+  // ✅ Build a lookup map from escalationTargets (number -> {name, number})
+  // Only needed for events that DON'T have assignedTarget snapshot.
+  const needNumbers = new Set();
+  for (const ev of items) {
+    if (ev?.assignedTarget?.number) continue;
+    for (const n of ev?.alertedTargets || []) needNumbers.add(String(n));
+  }
+
+  let targetMap = new Map();
+  if (needNumbers.size) {
+    const targetDocs = await escalationTargets
+      .find({ number: { $in: Array.from(needNumbers) } }, { projection: { name: 1, number: 1 } })
+      .toArray();
+
+    targetMap = new Map(targetDocs.map((t) => [String(t.number), { name: t.name, number: t.number }]));
+  }
+
+  const enriched = items.map((ev) => {
+    // ✅ If assignedTarget exists, that’s the “owner”
+    if (ev?.assignedTarget?.number) {
+      return {
+        ...ev,
+        targetsDetailed: [
+          {
+            name: ev.assignedTarget.name || "Target",
+            number: ev.assignedTarget.number,
+          },
+        ],
+      };
+    }
+
+    // Otherwise use the config-based alertedTargets list (numbers), enriched from DB if possible
+    const targetsDetailed = (ev.alertedTargets || []).map((n) => {
+      const key = String(n);
+      return targetMap.get(key) || { name: "Target", number: key };
+    });
+
+    return { ...ev, targetsDetailed };
+  });
+
+  res.json({ items: enriched });
 });
+
 
 
 // Batch progress
