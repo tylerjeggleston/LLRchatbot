@@ -211,7 +211,10 @@ function isHumanTakeover(session) {
 function isLowValueClosingMessage(text = "") {
   const t = normalizeTextForMatching(text);
 
-  // common "no need to reply" messages
+  // only classify as closing if short
+  const wordCount = t.split(" ").filter(Boolean).length;
+  if (wordCount > 5) return false;
+
   const patterns = [
     "thanks", "thank you", "thx", "ty",
     "ok", "okay", "k", "cool", "awesome",
@@ -221,8 +224,9 @@ function isLowValueClosingMessage(text = "") {
     "have a great day", "have a good day"
   ];
 
-  return patterns.some(p => t === p || t.toLowerCase().includes(p));
+  return patterns.some((p) => t === p);
 }
+
 
 function lastAssistantWasClosing(history = []) {
   const lastOutbound = [...(history || [])].reverse().find(
@@ -1724,6 +1728,7 @@ app.get("/api/conversations/:userId", async (req, res) => {
 });
 
 app.post("/api/conversations/:userId/send", async (req, res) => {
+  const now = new Date();
   const { message } = req.body || {};
   if (!message) return res.status(400).json({ error: "message_required" });
 
