@@ -204,42 +204,6 @@ async function isOptedOutUserId(userId) {
   return !!doc?.optedOut;
 }
 
-function isHumanTakeover(session) {
-  return !!session?.humanTakeover;
-}
-
-function isLowValueClosingMessage(text = "") {
-  const t = normalizeTextForMatching(text);
-
-  // common "no need to reply" messages
-  const patterns = [
-    "thanks", "thank you", "thx", "ty",
-    "ok", "okay", "k", "cool", "awesome",
-    "sounds good", "got it", "understood",
-    "no problem", "all good",
-    "bye", "goodbye", "see you", "take care",
-    "have a great day", "have a good day"
-  ];
-
-  return patterns.some(p => t === p || t.toLowerCase().includes(p));
-}
-
-function lastAssistantWasClosing(history = []) {
-  const lastOutbound = [...(history || [])].reverse().find(
-    m => m?.role === "assistant" || m?.role === "agent"
-  );
-  if (!lastOutbound?.content) return false;
-
-  const t = normalizeTextForMatching(lastOutbound.content);
-  return (
-    t.includes("have a great day") ||
-    t.includes("have a good day") ||
-    t.includes("take care") ||
-    t.includes("bye")
-  );
-}
-
-
 
 function normalizeToE164(input, defaultCountryCode = "1") {
   const raw = String(input || "").trim();
@@ -320,11 +284,6 @@ Rules:
 - No markdown, no bullet spam.
 - If user asks multiple questions, answer in 1-2 tight sentences.
 - If they ask for sensitive personal data, refuse.
-- Do NOT say "Thank you" unless the user is paying or did something meaningful.
-- Never thank twice in one conversation.
-- If the conversation is clearly ending, reply once with a short closing and stop.
-- Avoid overly polite filler. Sound like a real person texting.
-- Always respond in the same language the user used.
 `;
 
 
@@ -638,11 +597,6 @@ app.post("/webhook/notificationapi/sms", async (req, res) => {
       return res.status(200).json({ ok: true, opted_out: true });
     }
 
-    // if human takeover is ON, do NOT schedule AI replies
-    if (existingSession?.humanTakeover) {
-      return res.status(200).json({ ok: true, human_takeover: true });
-    }
-
     // 3. Keyword-based DNC (admin-defined)
     const dnc = await dncKeywords.find({ enabled: true }).toArray();
     const matchedDnc = dnc.find(k => {
@@ -873,19 +827,6 @@ if (["STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"].includes(upper))
       });
     }
 
-    // don't reply to low-value "closing" messages
-    const sessForCloseCheck = await sessions.findOne(
-      { userId },
-      { projection: { history: { $slice: -30 } } }
-    );
-
-    const hist = sessForCloseCheck?.history || [];
-
-    if (isLowValueClosingMessage(text) && lastAssistantWasClosing(hist)) {
-      return res.status(200).json({ ok: true, skipped: "closing_no_reply" });
-    }
-
-
     // 9. No escalation → enqueue AI reply
     const trackingId = lastTrackingId || `${userId}:${Date.now()}`;
     try {
@@ -933,27 +874,6 @@ async function processOneDueJob() {
 
     const existing = await sessions.findOne({ userId });
     const history = existing?.history || [];
-
-    // NEW: if agent took over, never send AI
-    if (existing?.humanTakeover) {
-      await replyJobs.updateOne(
-        { _id: job._id },
-        { $set: { status: "cancelled", cancelledAt: new Date(), note: "human_takeover_worker_guard" } }
-      );
-      return true;
-    }
-
-    // NEW: if agent already replied after this job was created → skip AI
-    if (existing?.lastAgentAt && job?.createdAt) {
-      if (new Date(existing.lastAgentAt) > new Date(job.createdAt)) {
-        await replyJobs.updateOne(
-          { _id: job._id },
-          { $set: { status: "cancelled", cancelledAt: new Date(), note: "agent_replied_after_queue" } }
-        );
-        return true;
-      }
-    }
-
 
     const faqHits = await fetchRelevantFaqs(text, 5);
     const topFaq = faqHits[0];
@@ -1558,7 +1478,6 @@ app.get("/api/conversations", async (req, res) => {
             lastAgentAt: 1,
             lastViewedAt: 1,
             hidden: 1,
-            humanTakeover: 1,
             history: { $slice: -1 },
           },
         })
@@ -1583,7 +1502,6 @@ app.get("/api/conversations", async (req, res) => {
             lastRole: d.history?.[0]?.role || "",
             unread,
             hidden: !!d.hidden,
-            humanTakeover: !!d.humanTakeover,
           };
         }),
       });
@@ -1631,7 +1549,6 @@ app.get("/api/conversations", async (req, res) => {
           lastAgentAt: 1,
           lastViewedAt: 1,
           hidden: 1,
-          humanTakeover: 1,
           history: { $slice: -1 },
         },
       })
@@ -1670,7 +1587,6 @@ app.get("/api/conversations", async (req, res) => {
           lastRole: d.history?.[0]?.role || "",
           unread,
           hidden: !!d.hidden,
-          humanTakeover: !!d.humanTakeover,
         };
       }),
       nextCursor,
@@ -1718,7 +1634,6 @@ app.get("/api/conversations/:userId", async (req, res) => {
     firstName: doc.firstName || "",
     lastName: doc.lastName || "",
     updatedAt: doc.updatedAt,
-    humanTakeover: !!doc.humanTakeover,
     history: doc.history || [],
   });
 });
@@ -1741,22 +1656,12 @@ app.post("/api/conversations/:userId/send", async (req, res) => {
     {
       $set: {
       updatedAt: new Date(),
-      lastAgentAt: new Date(),
-      humanTakeover: true,
-      humanTakeoverAt: now,
-      humanTakeoverBy: "agent",
+      lastAgentAt: new Date()
     },
 
       $push: { history: { $each: [{ role: "agent", content: String(message) , createdAt: new Date()}], $slice: -50 } },
     }
   );
-
-  // cancel any pending AI jobs for this user
-  await replyJobs.updateMany(
-    { userId: doc.userId, status: "queued" },
-    { $set: { status: "cancelled", cancelledAt: new Date(), note: "human_takeover" } }
-  );
-
 
   res.json({ ok: true });
 });
@@ -1782,62 +1687,7 @@ app.post("/api/conversations/:userId/read", async (req, res) => {
   }
 });
 
-app.post("/api/conversations/:userId/ai/resume", requireAdmin, async (req, res) => {
-  try {
-    const userId = String(req.params.userId || "").trim();
-    if (!userId) return res.status(400).json({ error: "userId_required" });
-
-    await sessions.updateOne(
-      { userId },
-      {
-        $set: {
-          humanTakeover: false,
-          humanTakeoverEndedAt: new Date(),
-          updatedAt: new Date(),
-        },
-      }
-    );
-
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("resume ai error:", e);
-    res.status(500).json({ ok: false });
-  }
-});
-
-app.post("/api/conversations/:userId/ai/takeover", requireAdmin, async (req, res) => {
-  try {
-    const userId = String(req.params.userId || "").trim();
-    if (!userId) return res.status(400).json({ error: "userId_required" });
-
-    const now = new Date();
-
-    await sessions.updateOne(
-      { userId },
-      {
-        $set: {
-          humanTakeover: true,
-          humanTakeoverAt: now,
-          updatedAt: now,
-        },
-      }
-    );
-
-    // cancel queued AI jobs
-    await replyJobs.updateMany(
-      { userId, status: "queued" },
-      { $set: { status: "cancelled", cancelledAt: now, note: "manual_takeover" } }
-    );
-
-    res.json({ ok: true, humanTakeover: true });
-  } catch (e) {
-    console.error("takeover error:", e);
-    res.status(500).json({ ok: false });
-  }
-});
-
-
-
+// List DNC Events
 // List DNC Events (ENRICH NAMES)
 app.get("/api/dnc/events", requireAdmin, async (req, res) => {
   try {
