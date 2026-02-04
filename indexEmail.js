@@ -7,6 +7,11 @@ const axios = require("axios");
 const { MongoClient, ObjectId } = require("mongodb");
 const notificationapi = require("notificationapi-node-server-sdk").default;
 
+const nodemailer = require("nodemailer");
+
+
+
+
 const app = express();
 
 app.use(
@@ -67,6 +72,12 @@ let outboundSettings;
 let outboundBatches;
 let outboundQueue;
 
+// Email blast:
+let emailSettings;
+let emailBatches;
+let emailQueue;
+
+
 async function initDb() {
   await mongo.connect();
   const db = mongo.db(MONGODB_DB);
@@ -86,6 +97,11 @@ async function initDb() {
   outboundSettings = db.collection("Outbound_Settings");
   outboundBatches = db.collection("Outbound_Batches");
   outboundQueue = db.collection("Outbound_Queue");
+
+  emailSettings = db.collection("Email_Settings");
+  emailBatches = db.collection("Email_Batches");
+  emailQueue = db.collection("Email_Queue");
+
 
   // sessions
   await sessions.createIndex({ userId: 1 }, { unique: true });
@@ -131,6 +147,12 @@ async function initDb() {
 
   await dncEvents.createIndex({ userId: 1, createdAt: -1 });
   await sessions.createIndex({ hidden: 1, updatedAt: -1, userId: 1 });
+
+  await emailSettings.createIndex({ key: 1 }, { unique: true });
+  await emailBatches.createIndex({ createdAt: -1 });
+  await emailQueue.createIndex({ batchId: 1, runAt: 1 });
+  await emailQueue.createIndex({ status: 1, runAt: 1 });
+  await emailQueue.createIndex({ trackingId: 1 }, { unique: true });
 
 
   console.log("✅ Mongo connected");
@@ -455,6 +477,129 @@ async function getOverallGoal() {
 //   );
 
 // }
+
+
+
+
+  function normalizeEmail(input) {
+  const e = String(input || "").trim().toLowerCase();
+  if (!e) return null;
+  // simple sanity check (good enough for 99% lists)
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) return null;
+  return e;
+}
+
+function renderEmail(template, vars) {
+  let out = String(template || "");
+  const firstName = String(vars.firstName || "").trim();
+  const lastName = String(vars.lastName || "").trim();
+  const fullName = `${firstName} ${lastName}`.trim();
+
+  const map = { firstName, lastName, fullName };
+
+  for (const k of Object.keys(map)) {
+    out = out.replaceAll(`{{${k}}}`, map[k]);
+    out = out.replaceAll(`{${k}}`, map[k]);
+  }
+
+  out = out.replace(/\s{2,}/g, " ").trim();
+  return out;
+}
+
+async function getEmailBlastTemplate() {
+  const doc = await emailSettings.findOne({ key: "email_blast_template" });
+  return (
+    doc || {
+      key: "email_blast_template",
+      subject: "Quick question, {{firstName}}",
+      body: "Hey {{firstName}},\n\nAre you free for a quick chat?\n\n- Calldesk",
+      enabled: true,
+    }
+  );
+}
+
+const SMTP_HOST = process.env.SMTP_HOST;
+const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
+const SMTP_USER = process.env.SMTP_USER;
+const SMTP_PASS = process.env.SMTP_PASS;
+const EMAIL_FROM = SMTP_USER;
+
+const smtpTransport =
+  SMTP_HOST && SMTP_USER && SMTP_PASS
+    ? nodemailer.createTransport({
+        host: SMTP_HOST,
+        port: SMTP_PORT,
+        secure: SMTP_PORT === 465,
+        auth: { user: SMTP_USER, pass: SMTP_PASS },
+      })
+    : null;
+
+async function sendEmailViaSMTP({ to, subject, text }) {
+  if (!smtpTransport) throw new Error("smtp_not_configured");
+  await smtpTransport.sendMail({ from: EMAIL_FROM, to, subject, text });
+}
+
+async function processOneEmailJob() {
+  const now = new Date();
+
+  const claimed = await emailQueue.findOneAndUpdate(
+    { status: "queued", runAt: { $lte: now } },
+    { $set: { status: "processing", processingAt: now } },
+    { sort: { runAt: 1 }, returnDocument: "after" }
+  );
+
+  const job = claimed?.value ?? claimed ?? null;
+  if (!job || !job._id) return false;
+
+  try {
+    // choose ONE sender (pick your path)
+    // await sendEmailViaSendGrid({ to: job.email, subject: job.subject, text: job.body });
+    // await sendEmailViaSMTP({ to: job.email, subject: job.subject, text: job.body });
+    await sendEmailViaSMTP({
+    to: job.email,
+    subject: job.subject,
+    text: job.body,
+  });
+
+    await emailQueue.updateOne(
+      { _id: job._id },
+      { $set: { status: "sent", sentAt: new Date() } }
+    );
+
+    await emailBatches.updateOne(
+      { _id: job.batchId },
+      { $inc: { sent: 1 }, $set: { updatedAt: new Date() } }
+    );
+
+    return true;
+  } catch (e) {
+    await emailQueue.updateOne(
+      { _id: job._id },
+      { $set: { status: "failed", failedAt: new Date(), error: String(e?.message || e) } }
+    );
+
+    await emailBatches.updateOne(
+      { _id: job.batchId },
+      { $inc: { failed: 1 }, $set: { updatedAt: new Date() } }
+    );
+
+    return true;
+  }
+}
+
+function startEmailWorker() {
+  setInterval(async () => {
+    try {
+      await processOneEmailJob();
+    } catch (e) {
+      console.error("Email worker tick error:", e?.message || e);
+    }
+  }, 500);
+
+  console.log("✅ Email worker started");
+}
+
+
 
 async function sendEscalationAlerts({ userId, from, text, matchedKeywords, inboundFirstName, inboundLastName }) {
   const cfg = await getEscalationConfig();
@@ -2142,6 +2287,160 @@ app.delete("/api/faq/:id", requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
+
+app.get("/api/email/template", requireAdmin, async (req, res) => {
+  const doc = await getEmailBlastTemplate();
+  res.json({
+    subject: doc.subject || "",
+    body: doc.body || "",
+    enabled: !!doc.enabled,
+  });
+});
+
+app.post("/api/email/template", requireAdmin, async (req, res) => {
+  const subject = String(req.body?.subject || "").trim();
+  const body = String(req.body?.body || "").trim();
+  const enabled = req.body?.enabled;
+
+  if (!subject) return res.status(400).json({ error: "subject_required" });
+  if (!body) return res.status(400).json({ error: "body_required" });
+
+  await emailSettings.updateOne(
+    { key: "email_blast_template" },
+    {
+      $set: {
+        subject,
+        body,
+        enabled: typeof enabled === "boolean" ? enabled : true,
+        updatedAt: new Date(),
+      },
+      $setOnInsert: { key: "email_blast_template", createdAt: new Date() },
+    },
+    { upsert: true }
+  );
+
+  res.json({ ok: true });
+});
+
+
+// Body: { rows: [{ email, firstName?, lastName? }], spacingMs?: number }
+app.post("/api/email/batch", requireAdmin, async (req, res) => {
+  try {
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    const spacingMs = Math.max(200, Number(req.body?.spacingMs || 800)); // keep sane
+    const dailyCap = Math.max(1, Number(req.body?.dailyCap || 5000));
+
+    if (!rows.length) return res.status(400).json({ error: "rows_required" });
+    if (rows.length > 20000) return res.status(400).json({ error: "too_many_rows" });
+
+    const tpl = await getEmailBlastTemplate();
+    if (!tpl.enabled) return res.status(409).json({ error: "email_template_disabled" });
+
+    const batchId = new ObjectId().toString();
+    const now = Date.now();
+
+    await emailBatches.insertOne({
+      _id: batchId,
+      status: "queued",
+      total: rows.length,
+      accepted: 0,
+      rejected: 0,
+      sent: 0,
+      failed: 0,
+      skipped: 0,
+      spacingMs,
+      dailyCap,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    let accepted = 0;
+    let rejected = 0;
+    const rejects = [];
+    const queueDocs = [];
+
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i] || {};
+      const emailRaw = r.email || r.Email || "";
+      const email = normalizeEmail(emailRaw);
+      if (!email) {
+        rejected++;
+        rejects.push({ index: i, email: String(emailRaw), reason: "invalid_email" });
+        continue;
+      }
+
+      const firstName = String(r.firstName || r.firstname || "").trim();
+      const lastName = String(r.lastName || r.lastname || "").trim();
+
+      const subject = renderEmail(tpl.subject, { firstName, lastName });
+      const body = renderEmail(tpl.body, { firstName, lastName });
+
+      const runAt = new Date(now + accepted * spacingMs);
+      const trackingId = `${batchId}:${email}:${accepted}`;
+
+      queueDocs.push({
+        trackingId,
+        batchId,
+        email,
+        firstName,
+        lastName,
+        subject,
+        body,
+        status: "queued",
+        runAt,
+        createdAt: new Date(),
+      });
+
+      accepted++;
+      if (accepted >= dailyCap) break; // hard cap safety
+    }
+
+    if (queueDocs.length) {
+      await emailQueue.insertMany(queueDocs, { ordered: false });
+    }
+
+    await emailBatches.updateOne(
+      { _id: batchId },
+      {
+        $set: {
+          accepted,
+          rejected,
+          status: "queued",
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    res.json({
+      ok: true,
+      batchId,
+      total: rows.length,
+      accepted,
+      rejected,
+      rejects: rejects.slice(0, 50),
+      spacingMs,
+      dailyCap,
+    });
+  } catch (e) {
+    console.error("email/batch error:", e);
+    res.status(500).json({ error: "failed" });
+  }
+});
+
+app.get("/api/email/batch/:batchId", requireAdmin, async (req, res) => {
+  const doc = await emailBatches.findOne({ _id: req.params.batchId });
+  if (!doc) return res.status(404).json({ error: "not_found" });
+  res.json(doc);
+});
+
+app.get("/api/email/failed", requireAdmin, async (req, res) => {
+  const limit = Math.min(Number(req.query.limit || 50), 200);
+  const items = await emailQueue.find({ status: "failed" }).sort({ failedAt: -1 }).limit(limit).toArray();
+  res.json({ items });
+});
+
+
+
 // Health
 app.get("/health", (req, res) => res.json({ ok: true }));
 
@@ -2150,6 +2449,7 @@ initDb()
   .then(() => {
     startReplyWorker();
     startOutboundWorker();
+    startEmailWorker();
     app.listen(PORT, () => console.log(`✅ Server listening on :${PORT}`));
   })
   .catch((e) => {
