@@ -6,10 +6,12 @@ const cors = require("cors");
 const axios = require("axios");
 const { MongoClient, ObjectId } = require("mongodb");
 const notificationapi = require("notificationapi-node-server-sdk").default;
-
+const sgMail = require("@sendgrid/mail");
 const nodemailer = require("nodemailer");
 const multer = require("multer");
 const upload = multer();
+const Mailgun = require("mailgun.js");
+const formData = require("form-data");
 
 
 
@@ -41,6 +43,31 @@ const MONGODB_DB = process.env.MONGODB_DB || "llrchatbot";
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY || ""; // optional
 const REPLY_DELAY_MS = Number(process.env.REPLY_DELAY_MS || 15000);
 const FAQ_DIRECT_THRESHOLD = Number(process.env.FAQ_DIRECT_THRESHOLD || 2.5);
+
+const EMAIL_PROVIDER = "mailgun"
+
+const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY;
+const SENDGRID_FROM_EMAIL = process.env.SENDGRID_FROM_EMAIL;
+const SENDGRID_ASM_GROUP_ID = Number(process.env.SENDGRID_ASM_GROUP_ID || 0);
+
+const EMAIL_DAILY_CAP = 5000;
+const EMAIL_RATE_PER_SECOND = 2;
+
+if (SENDGRID_API_KEY) sgMail.setApiKey(SENDGRID_API_KEY);
+const MAILGUN_API_KEY = process.env.MAILGUN_API_KEY;
+const MAILGUN_DOMAIN = process.env.MAILGUN_DOMAIN;
+const MAILGUN_FROM = process.env.EMAIL_FROM;
+const MAILGUN_REGION = (process.env.MAILGUN_REGION || "US").toUpperCase();
+
+const mailgunClient =
+  MAILGUN_API_KEY
+    ? new Mailgun(formData).client({
+        username: "api",
+        key: MAILGUN_API_KEY,
+        url: MAILGUN_REGION === "EU" ? "https://api.eu.mailgun.net" : "https://api.mailgun.net",
+      })
+    : null;
+
 
 // Bulk outbound config
 const OUTBOUND_SPACING_MS = Number(process.env.OUTBOUND_SPACING_MS || 5000); // 5 seconds default
@@ -339,6 +366,32 @@ async function processOneEmailReplyJob() {
     return true;
   }
 }
+
+async function sendEmailViaMailgun({ to, subject, text, trackingId }) {
+  if (!mailgunClient) throw new Error("mailgun_not_configured");
+  if (!MAILGUN_DOMAIN) throw new Error("mailgun_domain_missing");
+  if (!MAILGUN_FROM) throw new Error("mailgun_from_missing");
+
+  // Marketing safety basics:
+  // - include unsubscribe instructions in the body (you already do in replies)
+  // - set List-Unsubscribe headers (helps deliverability + compliance)
+  const data = {
+    from: MAILGUN_FROM,
+    to,
+    subject,
+    text,
+
+    // Optional tags + variables for tracking/debug
+    "o:tag": trackingId ? ["email-blast", String(trackingId).slice(0, 128)] : ["email-blast"],
+
+    // Mailgun supports custom headers via h: prefix
+    "h:List-Unsubscribe": "<mailto:unsubscribe@getleadslockerroom.com?subject=unsubscribe>",
+    "h:List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+  };
+
+  await mailgunClient.messages.create(MAILGUN_DOMAIN, data);
+}
+
 
 function startEmailReplyWorker() {
   setInterval(async () => {
@@ -815,9 +868,37 @@ async function sendEmailViaSMTP({ to, subject, text }) {
   await smtpTransport.sendMail({ from: EMAIL_FROM, to, subject, text });
 }
 
+async function sendEmailViaSendGrid({ to, subject, text, trackingId }) {
+  if (!SENDGRID_API_KEY) throw new Error("sendgrid_not_configured");
+  if (!SENDGRID_FROM_EMAIL) throw new Error("sendgrid_from_missing");
+
+  const msg = {
+    to,
+    from: SENDGRID_FROM_EMAIL,
+    subject,
+    text,
+
+    // Unsubscribe group (promo compliance)
+    ...(SENDGRID_ASM_GROUP_ID ? { asm: { groupId: SENDGRID_ASM_GROUP_ID } } : {}),
+
+    // Helpful metadata (debug + analytics)
+    customArgs: trackingId ? { trackingId: String(trackingId) } : undefined,
+
+    // Optional: one-click unsubscribe headers (extra-safe)
+    headers: {
+      "List-Unsubscribe": "<mailto:unsubscribe@leadslockerroom.com?subject=unsubscribe>",
+      "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+    },
+  };
+
+  await sgMail.send(msg);
+}
+
+
 async function processOneEmailJob() {
   const now = new Date();
 
+  // 1) claim next job first
   const claimed = await emailQueue.findOneAndUpdate(
     { status: "queued", runAt: { $lte: now } },
     { $set: { status: "processing", processingAt: now } },
@@ -825,17 +906,51 @@ async function processOneEmailJob() {
   );
 
   const job = claimed?.value ?? claimed ?? null;
-  if (!job || !job._id) return false;
+  if (!job?._id) return false;
 
+  // 2) global daily cap (UTC)
+  const todayStart = new Date();
+  todayStart.setUTCHours(0, 0, 0, 0);
+
+  const sentToday = await emailQueue.countDocuments({
+    status: "sent",
+    sentAt: { $gte: todayStart },
+  });
+
+  if (sentToday >= EMAIL_DAILY_CAP) {
+    await emailQueue.updateOne(
+      { _id: job._id },
+      { $set: { status: "skipped_daily_cap", skippedAt: new Date() } }
+    );
+
+    await emailBatches.updateOne(
+      { _id: job.batchId },
+      { $inc: { skipped: 1 }, $set: { updatedAt: new Date() } }
+    );
+
+    return true; // consumed job
+  }
+
+  // 3) send
   try {
-    // choose ONE sender (pick your path)
-    // await sendEmailViaSendGrid({ to: job.email, subject: job.subject, text: job.body });
-    // await sendEmailViaSMTP({ to: job.email, subject: job.subject, text: job.body });
-    await sendEmailViaSMTP({
+    if (EMAIL_PROVIDER === "mailgun") {
+  await sendEmailViaMailgun({
     to: job.email,
     subject: job.subject,
     text: job.body,
+    trackingId: job.trackingId,
   });
+} else if (EMAIL_PROVIDER === "sendgrid") {
+  await sendEmailViaSendGrid({
+    to: job.email,
+    subject: job.subject,
+    text: job.body,
+    trackingId: job.trackingId,
+  });
+} else {
+  await sendEmailViaSMTP({ to: job.email, subject: job.subject, text: job.body });
+}
+
 
     await emailQueue.updateOne(
       { _id: job._id },
@@ -863,17 +978,21 @@ async function processOneEmailJob() {
   }
 }
 
+
 function startEmailWorker() {
+  const tickMs = Math.ceil(1000 / Math.max(1, EMAIL_RATE_PER_SECOND));
+
   setInterval(async () => {
     try {
       await processOneEmailJob();
     } catch (e) {
       console.error("Email worker tick error:", e?.message || e);
     }
-  }, 500);
+  }, tickMs);
 
-  console.log("✅ Email worker started");
+  console.log("✅ Email worker started", { tickMs, EMAIL_RATE_PER_SECOND });
 }
+
 
 
 
