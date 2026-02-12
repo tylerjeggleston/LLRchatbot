@@ -214,6 +214,36 @@ async function initDb() {
 
 // ----------------- Helpers -----------------
 
+function escapeHtml(s) {
+  return String(s || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function escapeHtmlToParagraphs(text) {
+  const lines = String(text || "").split(/\r?\n/);
+  let html = "";
+  let buf = [];
+
+  for (const line of lines) {
+    if (line.trim() === "") {
+      if (buf.length) {
+        html += `<p style="margin:0 0 12px 0;">${escapeHtml(buf.join(" "))}</p>`;
+        buf = [];
+      }
+      continue;
+    }
+    buf.push(line.trim());
+  }
+
+  if (buf.length) html += `<p style="margin:0 0 12px 0;">${escapeHtml(buf.join(" "))}</p>`;
+  return html || "";
+}
+
+
 async function verifySmtp() {
   if (!smtpTransport) {
     console.log("❌ SMTP not configured");
@@ -778,9 +808,15 @@ function renderEmail(template, vars) {
     out = out.replaceAll(`{${k}}`, map[k]);
   }
 
-  out = out.replace(/\s{2,}/g, " ").trim();
-  return out;
+  // ✅ Only collapse repeated spaces/tabs (NOT newlines)
+  out = out.replace(/[^\S\r\n]{2,}/g, " ");
+
+  // Optional: normalize trailing spaces per line
+  out = out.replace(/[^\S\r\n]+$/gm, "");
+
+  return out.trim();
 }
+
 
 async function getEmailBlastTemplate() {
   const doc = await emailSettings.findOne({ key: "email_blast_template" });
@@ -788,11 +824,17 @@ async function getEmailBlastTemplate() {
     doc || {
       key: "email_blast_template",
       subject: "Quick question, {{firstName}}",
-      body: "Hey {{firstName}},\n\nAre you free for a quick chat?\n\n- Leads Locker Room",
+      body: "Hey {{firstName}},\n\nAre you free for a quick chat?\n",
+      signatureText: "— Leads Locker Room\nleadslockerroom.com",
+      signatureHtml:
+        "— <b>Leads Locker Room</b><br/><a href='https://leadslockerroom.com'>leadslockerroom.com</a>",
+      flyerImageUrl: "",
       enabled: true,
     }
   );
 }
+
+
 
 const SMTP_HOST = process.env.SMTP_HOST;
 const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
@@ -810,10 +852,17 @@ const smtpTransport =
       })
     : null;
 
-async function sendEmailViaSMTP({ to, subject, text }) {
+async function sendEmailViaSMTP({ to, subject, text, html }) {
   if (!smtpTransport) throw new Error("smtp_not_configured");
-  await smtpTransport.sendMail({ from: EMAIL_FROM, to, subject, text });
+  await smtpTransport.sendMail({
+    from: EMAIL_FROM,
+    to,
+    subject,
+    text,
+    html,
+  });
 }
+
 
 async function processOneEmailJob() {
   const now = new Date();
@@ -832,10 +881,11 @@ async function processOneEmailJob() {
     // await sendEmailViaSendGrid({ to: job.email, subject: job.subject, text: job.body });
     // await sendEmailViaSMTP({ to: job.email, subject: job.subject, text: job.body });
     await sendEmailViaSMTP({
-    to: job.email,
-    subject: job.subject,
-    text: job.body,
-  });
+  to: job.email,
+  subject: job.subject,
+  text: job.textBody || job.body,
+  html: job.htmlBody || undefined,
+});
 
     await emailQueue.updateOne(
       { _id: job._id },
@@ -2564,18 +2614,26 @@ app.delete("/api/faq/:id", requireAdmin, async (req, res) => {
 });
 
 
-app.get("/api/email/template", requireAdmin, async (req, res) => {
+app.get("/api/email/template", async (req, res) => {
   const doc = await getEmailBlastTemplate();
   res.json({
     subject: doc.subject || "",
     body: doc.body || "",
+    signatureText: doc.signatureText || "",
+    signatureHtml: doc.signatureHtml || "",
+    flyerImageUrl: doc.flyerImageUrl || "",
     enabled: !!doc.enabled,
   });
 });
 
-app.post("/api/email/template", requireAdmin, async (req, res) => {
+
+
+app.post("/api/email/template", async (req, res) => {
   const subject = String(req.body?.subject || "").trim();
   const body = String(req.body?.body || "").trim();
+  const signatureText = String(req.body?.signatureText || "").trim();
+  const signatureHtml = String(req.body?.signatureHtml || "").trim();
+  const flyerImageUrl = String(req.body?.flyerImageUrl || "").trim();
   const enabled = req.body?.enabled;
 
   if (!subject) return res.status(400).json({ error: "subject_required" });
@@ -2587,6 +2645,9 @@ app.post("/api/email/template", requireAdmin, async (req, res) => {
       $set: {
         subject,
         body,
+        signatureText,
+        signatureHtml,
+        flyerImageUrl,
         enabled: typeof enabled === "boolean" ? enabled : true,
         updatedAt: new Date(),
       },
@@ -2600,7 +2661,7 @@ app.post("/api/email/template", requireAdmin, async (req, res) => {
 
 
 // Body: { rows: [{ email, firstName?, lastName? }], spacingMs?: number }
-app.post("/api/email/batch", requireAdmin, async (req, res) => {
+app.post("/api/email/batch", async (req, res) => {
   try {
     const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
     const spacingMs = Math.max(200, Number(req.body?.spacingMs || 800)); // keep sane
@@ -2649,7 +2710,26 @@ app.post("/api/email/batch", requireAdmin, async (req, res) => {
       const lastName = String(r.lastName || r.lastname || "").trim();
 
       const subject = renderEmail(tpl.subject, { firstName, lastName });
-      const body = renderEmail(tpl.body, { firstName, lastName });
+
+      const mainText = renderEmail(tpl.body, { firstName, lastName });
+      const sigText = renderEmail(tpl.signatureText || "", { firstName, lastName });
+      const textBody = [mainText, sigText].filter(Boolean).join("\n\n").trim();
+
+      // HTML version (minimal + safe)
+      const safeFlyerUrl = String(tpl.flyerImageUrl || "").trim();
+      const flyerHtml = safeFlyerUrl
+        ? `<div style="margin-top:12px;"><img src="${safeFlyerUrl}" alt="Leads Locker Room" style="max-width:600px;width:100%;height:auto;border:0;" /></div>`
+        : "";
+
+      const sigHtmlRaw = tpl.signatureHtml || "";
+      const sigHtml = renderEmail(sigHtmlRaw, { firstName, lastName });
+
+      const htmlBody =
+        `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.45;color:#111;">` +
+        `${escapeHtmlToParagraphs(mainText)}` +
+        `${sigHtml ? `<div style="margin-top:16px;">${sigHtml}</div>` : ""}` +
+        `${flyerHtml}` +
+        `</div>`;
 
       const runAt = new Date(now + accepted * spacingMs);
       const trackingId = `${batchId}:${email}:${accepted}`;
@@ -2661,7 +2741,8 @@ app.post("/api/email/batch", requireAdmin, async (req, res) => {
         firstName,
         lastName,
         subject,
-        body,
+        textBody,
+        htmlBody,
         status: "queued",
         runAt,
         createdAt: new Date(),
