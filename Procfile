@@ -1,1 +1,1 @@
-web: node indexmailgun.js
+web: node index.js

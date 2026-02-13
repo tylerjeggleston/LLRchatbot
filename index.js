@@ -7,6 +7,12 @@ const axios = require("axios");
 const { MongoClient, ObjectId } = require("mongodb");
 const notificationapi = require("notificationapi-node-server-sdk").default;
 
+const nodemailer = require("nodemailer");
+const multer = require("multer");
+const upload = multer();
+
+
+
 const app = express();
 
 app.use(
@@ -42,6 +48,8 @@ const OUTBOUND_WORKER_POLL_MS = Number(process.env.OUTBOUND_WORKER_POLL_MS || 10
 
 if (!NOTIF_CLIENT_ID || !NOTIF_CLIENT_SECRET) throw new Error("Missing NOTIF_CLIENT_ID / NOTIF_CLIENT_SECRET");
 if (!NOTIF_INBOUND_WEBHOOK_SECRET) throw new Error("Missing NOTIF_INBOUND_WEBHOOK_SECRET");
+if (!process.env.EMAIL_INBOUND_WEBHOOK_SECRET) throw new Error("Missing EMAIL_INBOUND_WEBHOOK_SECRET");
+
 if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
 if (!MONGODB_URI) throw new Error("Missing MONGODB_URI");
 
@@ -67,6 +75,17 @@ let outboundSettings;
 let outboundBatches;
 let outboundQueue;
 
+// Email blast:
+let emailSettings;
+let emailBatches;
+let emailQueue;
+
+let emailSessions;
+let emailWebhookEvents;
+let emailReplyJobs;
+
+
+
 async function initDb() {
   await mongo.connect();
   const db = mongo.db(MONGODB_DB);
@@ -86,6 +105,15 @@ async function initDb() {
   outboundSettings = db.collection("Outbound_Settings");
   outboundBatches = db.collection("Outbound_Batches");
   outboundQueue = db.collection("Outbound_Queue");
+
+  emailSettings = db.collection("Email_Settings");
+  emailBatches = db.collection("Email_Batches");
+  emailQueue = db.collection("Email_Queue");
+
+  emailSessions = db.collection("Email_Sessions");
+  emailWebhookEvents = db.collection("Email_Webhook_Events");
+  emailReplyJobs = db.collection("Email_ReplyJobs");
+
 
   // sessions
   await sessions.createIndex({ userId: 1 }, { unique: true });
@@ -132,6 +160,23 @@ async function initDb() {
   await dncEvents.createIndex({ userId: 1, createdAt: -1 });
   await sessions.createIndex({ hidden: 1, updatedAt: -1, userId: 1 });
 
+  await emailSettings.createIndex({ key: 1 }, { unique: true });
+  await emailBatches.createIndex({ createdAt: -1 });
+  await emailQueue.createIndex({ batchId: 1, runAt: 1 });
+  await emailQueue.createIndex({ status: 1, runAt: 1 });
+  await emailQueue.createIndex({ trackingId: 1 }, { unique: true });
+
+  await emailSessions.createIndex({ userId: 1 }, { unique: true });
+  await emailSessions.createIndex({ email: 1 });
+  await emailSessions.createIndex({ updatedAt: -1 });
+
+  await emailWebhookEvents.createIndex({ trackingId: 1 }, { unique: true });
+  await emailWebhookEvents.createIndex({ createdAt: 1 }, { expireAfterSeconds: 7 * 24 * 3600 });
+
+  await emailReplyJobs.createIndex({ trackingId: 1 }, { unique: true });
+  await emailReplyJobs.createIndex({ status: 1, runAt: 1 });
+
+
 
   console.log("✅ Mongo connected");
 
@@ -168,6 +213,176 @@ async function initDb() {
 }
 
 // ----------------- Helpers -----------------
+
+function escapeHtml(s) {
+  return String(s || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function escapeHtmlToParagraphs(text) {
+  const lines = String(text || "").split(/\r?\n/);
+  let html = "";
+  let buf = [];
+
+  for (const line of lines) {
+    if (line.trim() === "") {
+      if (buf.length) {
+        html += `<p style="margin:0 0 12px 0;">${escapeHtml(buf.join(" "))}</p>`;
+        buf = [];
+      }
+      continue;
+    }
+    buf.push(line.trim());
+  }
+
+  if (buf.length) html += `<p style="margin:0 0 12px 0;">${escapeHtml(buf.join(" "))}</p>`;
+  return html || "";
+}
+
+
+async function verifySmtp() {
+  if (!smtpTransport) {
+    console.log("❌ SMTP not configured");
+    return;
+  }
+  try {
+    await smtpTransport.verify();
+    console.log("✅ SMTP verified");
+  } catch (e) {
+    console.log("❌ SMTP verify failed:", e?.message || e);
+  }
+}
+
+
+async function openaiEmailReply({ userText, history, faqContext = "" }) {
+  const goalCfg = await getOverallGoal();
+  const overallGoalText = goalCfg.enabled && goalCfg.goal ? goalCfg.goal : "(none)";
+
+  const system = `
+You are an AI email assistant for a business. Be clear, concise, and helpful.
+
+OVERALL GOAL:
+${overallGoalText}
+
+FAQ KB (source of truth when relevant):
+${faqContext || "(none)"}
+
+Rules:
+- Keep it under 120 words unless truly necessary.
+- No markdown.
+- Be direct and professional (not stiff).
+- Ask at most 1 question back.
+- If unsure, say what you need.
+- Don't mention internal systems, webhooks, APIs.
+- Always respond in the same language as the user.
+`.trim();
+
+  const messages = [
+    { role: "system", content: system },
+    ...(Array.isArray(history) ? history.slice(-10).map(m => ({
+      role: m.role === "agent" ? "assistant" : m.role === "customer" ? "user" : (m.role || "user"),
+      content: String(m.content || "")
+    })) : []),
+    { role: "user", content: userText },
+  ];
+
+  const resp = await axios.post(
+    "https://api.openai.com/v1/chat/completions",
+    { model: OPENAI_MODEL, messages, temperature: 0.3, max_tokens: 220 },
+    { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }, timeout: 60000 }
+  );
+
+  return resp.data?.choices?.[0]?.message?.content?.trim() || "";
+}
+
+async function processOneEmailReplyJob() {
+  const now = new Date();
+
+  const claimed = await emailReplyJobs.findOneAndUpdate(
+    { status: "queued", runAt: { $lte: now } },
+    { $set: { status: "processing", processingAt: now } },
+    { sort: { runAt: 1 }, returnDocument: "after" }
+  );
+
+  const job = claimed?.value ?? claimed ?? null;
+  if (!job?._id) return false;
+
+  try {
+    const sess = await emailSessions.findOne({ userId: job.userId });
+    const history = sess?.history || [];
+
+    const faqHits = await fetchRelevantFaqs(job.text, 5);
+    const topFaq = faqHits[0];
+
+    let replyText = "";
+    if (topFaq && typeof topFaq.score === "number" && topFaq.score >= FAQ_DIRECT_THRESHOLD) {
+      replyText = String(topFaq.answer || "").trim();
+    } else {
+      const faqContext = buildFaqContext(faqHits);
+      replyText = await openaiEmailReply({ userText: job.text, history, faqContext });
+    }
+
+    replyText = String(replyText || "").trim();
+    if (!replyText) {
+      await emailReplyJobs.updateOne({ _id: job._id }, { $set: { status: "done", doneAt: new Date(), note: "empty_reply" } });
+      return true;
+    }
+
+    // Add signature (keep stable)
+    const finalBody =
+      `${replyText}\n\n— Leads Locker Room\nIf you want no more emails, reply “unsubscribe”.`;
+
+    // IMPORTANT: preserve threading (if you have messageId)
+    // Nodemailer supports headers:
+    await smtpTransport.sendMail({
+      from: EMAIL_FROM,
+      to: job.toEmail,
+      subject: job.subject?.toLowerCase().startsWith("re:") ? job.subject : `Re: ${job.subject || "Quick question"}`,
+      text: finalBody,
+      headers: job.messageId
+        ? { "In-Reply-To": job.messageId, "References": job.messageId }
+        : undefined,
+    });
+
+    // Save outbound in session
+    await emailSessions.updateOne(
+      { userId: job.userId },
+      {
+        $set: { updatedAt: new Date() },
+        $push: { history: { $each: [{ role: "assistant", content: finalBody, createdAt: new Date() }], $slice: -50 } }
+      }
+    );
+
+    await emailReplyJobs.updateOne({ _id: job._id }, { $set: { status: "done", doneAt: new Date() } });
+    return true;
+
+  } catch (e) {
+    console.error("email reply job error:", e?.message || e);
+    await emailReplyJobs.updateOne(
+      { _id: job._id },
+      { $set: { status: "failed", failedAt: new Date(), error: String(e?.message || e) } }
+    );
+    return true;
+  }
+}
+
+function startEmailReplyWorker() {
+  setInterval(async () => {
+    try {
+      await processOneEmailReplyJob();
+    } catch (e) {
+      console.error("Email reply worker tick error:", e?.message || e);
+    }
+  }, 1500);
+
+  console.log("✅ Email reply worker started");
+}
+
+
 function requireAdmin(req, res, next) {
   if (!ADMIN_API_KEY) return next(); // public if unset (your preference right now)
   const key = req.header("x-admin-key");
@@ -226,6 +441,119 @@ function isLowValueClosingMessage(text = "") {
 
   return patterns.some((p) => t === p);
 }
+
+function normalizeEmailUserId(email) {
+  return String(email || "").trim().toLowerCase();
+}
+
+
+
+function safeJsonParse(s) {
+  try { return JSON.parse(s); } catch { return null; }
+}
+
+function extractFromEmail(payload) {
+  // Common direct fields
+  const direct =
+    payload.from ||
+    payload.sender ||
+    payload.From ||
+    payload["from_email"] ||
+    payload["sender_email"] ||
+    payload["from-address"];
+
+  // SendGrid often provides "from" like: 'John Doe <john@example.com>'
+  // Mailgun can provide "from" like that too.
+  if (direct) {
+    const m = String(direct).match(/<([^>]+)>/);
+    const raw = m ? m[1] : direct;
+    return normalizeEmail(raw);
+  }
+
+  // SendGrid inbound parse: envelope is JSON string containing from/to
+  // envelope: {"to":["x@domain.com"],"from":"john@example.com",...}
+  if (payload.envelope) {
+    const env = typeof payload.envelope === "string" ? safeJsonParse(payload.envelope) : payload.envelope;
+    if (env?.from) return normalizeEmail(env.from);
+  }
+
+  // Postmark sometimes uses FromFull: { Email, Name }
+  if (payload.FromFull?.Email) return normalizeEmail(payload.FromFull.Email);
+
+  // SES often includes mail.source or commonHeaders.from
+  if (payload.mail?.source) return normalizeEmail(payload.mail.source);
+  const fromArr = payload.mail?.commonHeaders?.from;
+  if (Array.isArray(fromArr) && fromArr[0]) {
+    const m = String(fromArr[0]).match(/<([^>]+)>/);
+    return normalizeEmail(m ? m[1] : fromArr[0]);
+  }
+
+  return null;
+}
+
+function extractEmailText(payload) {
+  // Try common plain-text fields first
+  const candidates = [
+    payload["stripped-text"],        // Mailgun best
+    payload["body-plain"],           // Mailgun
+    payload.text,                    // SendGrid inbound parse
+    payload.TextBody,                // Postmark
+    payload.textBody,
+    payload.plain,
+    payload["body"],                 // sometimes
+  ];
+
+  for (const c of candidates) {
+    const t = String(c || "").trim();
+    if (t) return t;
+  }
+
+  // HTML fallback (strip tags)
+  const html = String(
+    payload["stripped-html"] ||
+    payload["body-html"] ||
+    payload.html ||
+    payload.HtmlBody ||
+    ""
+  ).trim();
+
+  if (html) {
+    return html
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  return "";
+}
+
+
+function extractMessageId(payload) {
+  // Many providers include one of these:
+  return String(
+    payload["message-id"] ||
+    payload["Message-Id"] ||
+    payload.messageId ||
+    payload.MessageID ||
+    payload["MessageID"] ||
+    ""
+  ).trim();
+}
+
+
+
+
+function shouldIgnoreEmail(payload) {
+  const subject = String(payload.subject || "").toLowerCase();
+  // avoid loops: auto-replies, bounces, etc.
+  const auto = String(payload["auto-submitted"] || "").toLowerCase();
+  if (auto.includes("auto-replied") || auto.includes("auto-generated")) return true;
+  if (subject.includes("undeliver") || subject.includes("delivery status")) return true;
+  return false;
+}
+
 
 
 function lastAssistantWasClosing(history = []) {
@@ -455,6 +783,149 @@ async function getOverallGoal() {
 //   );
 
 // }
+
+
+
+
+  function normalizeEmail(input) {
+  const e = String(input || "").trim().toLowerCase();
+  if (!e) return null;
+  // simple sanity check (good enough for 99% lists)
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) return null;
+  return e;
+}
+
+function renderEmail(template, vars) {
+  let out = String(template || "");
+  const firstName = String(vars.firstName || "").trim();
+  const lastName = String(vars.lastName || "").trim();
+  const fullName = `${firstName} ${lastName}`.trim();
+
+  const map = { firstName, lastName, fullName };
+
+  for (const k of Object.keys(map)) {
+    out = out.replaceAll(`{{${k}}}`, map[k]);
+    out = out.replaceAll(`{${k}}`, map[k]);
+  }
+
+  // ✅ Only collapse repeated spaces/tabs (NOT newlines)
+  out = out.replace(/[^\S\r\n]{2,}/g, " ");
+
+  // Optional: normalize trailing spaces per line
+  out = out.replace(/[^\S\r\n]+$/gm, "");
+
+  return out.trim();
+}
+
+
+async function getEmailBlastTemplate() {
+  const doc = await emailSettings.findOne({ key: "email_blast_template" });
+  return (
+    doc || {
+      key: "email_blast_template",
+      subject: "Quick question, {{firstName}}",
+      body: "Hey {{firstName}},\n\nAre you free for a quick chat?\n",
+      signatureText: "— Leads Locker Room\nleadslockerroom.com",
+      signatureHtml:
+        "— <b>Leads Locker Room</b><br/><a href='https://leadslockerroom.com'>leadslockerroom.com</a>",
+      flyerImageUrl: "",
+      enabled: true,
+    }
+  );
+}
+
+
+
+const SMTP_HOST = process.env.SMTP_HOST;
+const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
+const SMTP_USER = process.env.SMTP_USER;
+const SMTP_PASS = process.env.SMTP_PASS;
+const EMAIL_FROM = process.env.EMAIL_FROM || SMTP_USER;
+
+const smtpTransport =
+  SMTP_HOST && SMTP_USER && SMTP_PASS
+    ? nodemailer.createTransport({
+        host: SMTP_HOST,
+        port: SMTP_PORT,
+        secure: SMTP_PORT === 465,
+        auth: { user: SMTP_USER, pass: SMTP_PASS },
+      })
+    : null;
+
+async function sendEmailViaSMTP({ to, subject, text, html }) {
+  if (!smtpTransport) throw new Error("smtp_not_configured");
+  await smtpTransport.sendMail({
+    from: EMAIL_FROM,
+    to,
+    subject,
+    text,
+    html,
+  });
+}
+
+
+async function processOneEmailJob() {
+  const now = new Date();
+
+  const claimed = await emailQueue.findOneAndUpdate(
+    { status: "queued", runAt: { $lte: now } },
+    { $set: { status: "processing", processingAt: now } },
+    { sort: { runAt: 1 }, returnDocument: "after" }
+  );
+
+  const job = claimed?.value ?? claimed ?? null;
+  if (!job || !job._id) return false;
+
+  try {
+    // choose ONE sender (pick your path)
+    // await sendEmailViaSendGrid({ to: job.email, subject: job.subject, text: job.body });
+    // await sendEmailViaSMTP({ to: job.email, subject: job.subject, text: job.body });
+    await sendEmailViaSMTP({
+  to: job.email,
+  subject: job.subject,
+  text: job.textBody || job.body,
+  html: job.htmlBody || undefined,
+});
+
+    await emailQueue.updateOne(
+      { _id: job._id },
+      { $set: { status: "sent", sentAt: new Date() } }
+    );
+
+    await emailBatches.updateOne(
+      { _id: job.batchId },
+      { $inc: { sent: 1 }, $set: { updatedAt: new Date() } }
+    );
+
+    return true;
+  } catch (e) {
+    await emailQueue.updateOne(
+      { _id: job._id },
+      { $set: { status: "failed", failedAt: new Date(), error: String(e?.message || e) } }
+    );
+
+    await emailBatches.updateOne(
+      { _id: job.batchId },
+      { $inc: { failed: 1 }, $set: { updatedAt: new Date() } }
+    );
+
+    return true;
+  }
+}
+
+function startEmailWorker() {
+  setInterval(async () => {
+    try {
+      await processOneEmailJob();
+    } catch (e) {
+      console.error("Email worker tick error:", e?.message || e);
+    }
+  }, 500);
+
+  console.log("✅ Email worker started");
+}
+
+
 
 async function sendEscalationAlerts({ userId, from, text, matchedKeywords, inboundFirstName, inboundLastName }) {
   const cfg = await getEscalationConfig();
@@ -2142,14 +2613,316 @@ app.delete("/api/faq/:id", requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
+
+app.get("/api/email/template", async (req, res) => {
+  const doc = await getEmailBlastTemplate();
+  res.json({
+    subject: doc.subject || "",
+    body: doc.body || "",
+    signatureText: doc.signatureText || "",
+    signatureHtml: doc.signatureHtml || "",
+    flyerImageUrl: doc.flyerImageUrl || "",
+    enabled: !!doc.enabled,
+  });
+});
+
+
+
+app.post("/api/email/template", async (req, res) => {
+  const subject = String(req.body?.subject || "").trim();
+  const body = String(req.body?.body || "").trim();
+  const signatureText = String(req.body?.signatureText || "").trim();
+  const signatureHtml = String(req.body?.signatureHtml || "").trim();
+  const flyerImageUrl = String(req.body?.flyerImageUrl || "").trim();
+  const enabled = req.body?.enabled;
+
+  if (!subject) return res.status(400).json({ error: "subject_required" });
+  if (!body) return res.status(400).json({ error: "body_required" });
+
+  await emailSettings.updateOne(
+    { key: "email_blast_template" },
+    {
+      $set: {
+        subject,
+        body,
+        signatureText,
+        signatureHtml,
+        flyerImageUrl,
+        enabled: typeof enabled === "boolean" ? enabled : true,
+        updatedAt: new Date(),
+      },
+      $setOnInsert: { key: "email_blast_template", createdAt: new Date() },
+    },
+    { upsert: true }
+  );
+
+  res.json({ ok: true });
+});
+
+
+// Body: { rows: [{ email, firstName?, lastName? }], spacingMs?: number }
+app.post("/api/email/batch", async (req, res) => {
+  try {
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    const spacingMs = Math.max(200, Number(req.body?.spacingMs || 800)); // keep sane
+    const dailyCap = Math.max(1, Number(req.body?.dailyCap || 5000));
+
+    if (!rows.length) return res.status(400).json({ error: "rows_required" });
+    if (rows.length > 20000) return res.status(400).json({ error: "too_many_rows" });
+
+    const tpl = await getEmailBlastTemplate();
+    if (!tpl.enabled) return res.status(409).json({ error: "email_template_disabled" });
+
+    const batchId = new ObjectId().toString();
+    const now = Date.now();
+
+    await emailBatches.insertOne({
+      _id: batchId,
+      status: "queued",
+      total: rows.length,
+      accepted: 0,
+      rejected: 0,
+      sent: 0,
+      failed: 0,
+      skipped: 0,
+      spacingMs,
+      dailyCap,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    let accepted = 0;
+    let rejected = 0;
+    const rejects = [];
+    const queueDocs = [];
+
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i] || {};
+      const emailRaw = r.email || r.Email || "";
+      const email = normalizeEmail(emailRaw);
+      if (!email) {
+        rejected++;
+        rejects.push({ index: i, email: String(emailRaw), reason: "invalid_email" });
+        continue;
+      }
+
+      const firstName = String(r.firstName || r.firstname || "").trim();
+      const lastName = String(r.lastName || r.lastname || "").trim();
+
+      const subject = renderEmail(tpl.subject, { firstName, lastName });
+
+      const mainText = renderEmail(tpl.body, { firstName, lastName });
+      const sigText = renderEmail(tpl.signatureText || "", { firstName, lastName });
+      const textBody = [mainText, sigText].filter(Boolean).join("\n\n").trim();
+
+      // HTML version (minimal + safe)
+      const safeFlyerUrl = String(tpl.flyerImageUrl || "").trim();
+      const flyerHtml = safeFlyerUrl
+        ? `<div style="margin-top:12px;"><img src="${safeFlyerUrl}" alt="Leads Locker Room" style="max-width:600px;width:100%;height:auto;border:0;" /></div>`
+        : "";
+
+      const sigHtmlRaw = tpl.signatureHtml || "";
+      const sigHtml = renderEmail(sigHtmlRaw, { firstName, lastName });
+
+      const htmlBody =
+        `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.45;color:#111;">` +
+        `${escapeHtmlToParagraphs(mainText)}` +
+        `${sigHtml ? `<div style="margin-top:16px;">${sigHtml}</div>` : ""}` +
+        `${flyerHtml}` +
+        `</div>`;
+
+      const runAt = new Date(now + accepted * spacingMs);
+      const trackingId = `${batchId}:${email}:${accepted}`;
+
+      queueDocs.push({
+        trackingId,
+        batchId,
+        email,
+        firstName,
+        lastName,
+        subject,
+        textBody,
+        htmlBody,
+        status: "queued",
+        runAt,
+        createdAt: new Date(),
+      });
+
+      accepted++;
+      if (accepted >= dailyCap) break; // hard cap safety
+    }
+
+    if (queueDocs.length) {
+      await emailQueue.insertMany(queueDocs, { ordered: false });
+    }
+
+    await emailBatches.updateOne(
+      { _id: batchId },
+      {
+        $set: {
+          accepted,
+          rejected,
+          status: "queued",
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    res.json({
+      ok: true,
+      batchId,
+      total: rows.length,
+      accepted,
+      rejected,
+      rejects: rejects.slice(0, 50),
+      spacingMs,
+      dailyCap,
+    });
+  } catch (e) {
+    console.error("email/batch error:", e);
+    res.status(500).json({ error: "failed" });
+  }
+});
+
+app.get("/api/email/batch/:batchId", requireAdmin, async (req, res) => {
+  const doc = await emailBatches.findOne({ _id: req.params.batchId });
+  if (!doc) return res.status(404).json({ error: "not_found" });
+  res.json(doc);
+});
+
+app.get("/api/email/failed", requireAdmin, async (req, res) => {
+  const limit = Math.min(Number(req.query.limit || 50), 200);
+  const items = await emailQueue.find({ status: "failed" }).sort({ failedAt: -1 }).limit(limit).toArray();
+  res.json({ items });
+});
+
+app.post("/webhook/email/inbound", upload.any(), async (req, res) => {
+
+  console.log("📩 inbound parsed", {
+  contentType: req.headers["content-type"],
+  bodyKeys: Object.keys(req.body || {}),
+  fromEmail_guess: extractFromEmail(req.body || {}),
+  subject: (req.body?.subject || req.body?.Subject || "").toString().slice(0, 120),
+  textLen: (extractEmailText(req.body || {}) || "").length,
+});
+
+  try {
+    if (req.query.token !== process.env.EMAIL_INBOUND_WEBHOOK_SECRET) {
+      return res.status(401).send("unauthorized");
+    }
+
+    const payload = req.body || {};
+    if (shouldIgnoreEmail(payload)) return res.status(200).json({ ok: true, ignored: "auto" });
+
+    // Provider fields differ. You must map these:
+    const fromEmail = extractFromEmail(payload);
+    const subject = String(payload.subject || payload.Subject || payload["subject"] || "").trim();
+
+    const text = extractEmailText(payload);
+    const messageId = extractMessageId(payload);
+
+    const trackingId = messageId || `email:${fromEmail}:${Date.now()}`;
+
+    if (!fromEmail || !text) return res.status(200).json({ ok: true, ignored: "missing_fields" });
+
+    // dedupe
+    try {
+      await emailWebhookEvents.insertOne({ trackingId, createdAt: new Date() });
+    } catch (e) {
+      if (String(e?.code) === "11000") return res.status(200).json({ ok: true, deduped: true });
+      throw e;
+    }
+
+    const userId = normalizeEmailUserId(fromEmail);
+
+    const existing = await emailSessions.findOne({ userId });
+
+    // opt-out guard (email)
+    if (existing?.optedOut) return res.status(200).json({ ok: true, opted_out: true });
+
+    // optional unsubscribe keyword detection
+    const lower = text.toLowerCase();
+    if (lower.includes("unsubscribe") || lower.includes("stop")) {
+      await emailSessions.updateOne(
+        { userId },
+        {
+          $setOnInsert: { userId, createdAt: new Date() },
+          $set: { email: fromEmail, optedOut: true, optedOutAt: new Date(), updatedAt: new Date() },
+          $push: { history: { $each: [{ role: "user", content: text, meta: { subject }, createdAt: new Date() }], $slice: -50 } },
+        },
+        { upsert: true }
+      );
+      return res.status(200).json({ ok: true, opted_out: true });
+    }
+
+    // Save inbound into Email_Sessions
+    await emailSessions.updateOne(
+      { userId },
+      {
+        $setOnInsert: { userId, createdAt: new Date() },
+        $set: {
+          email: fromEmail,
+          updatedAt: new Date(),
+          lastInboundAt: new Date(),
+        },
+        $push: {
+          history: {
+            $each: [{ role: "user", content: text, meta: { subject, messageId }, createdAt: new Date() }],
+            $slice: -50,
+          },
+        },
+      },
+      { upsert: true }
+    );
+
+    // Enqueue reply job (same pattern as SMS)
+    await emailReplyJobs.updateOne(
+      { trackingId },
+      {
+        $setOnInsert: {
+          trackingId,
+          userId,
+          toEmail: fromEmail,
+          subject,
+          messageId,
+          text,
+          status: "queued",
+          runAt: new Date(Date.now() + 10_000),
+          createdAt: new Date(),
+        },
+      },
+      { upsert: true }
+    );
+
+    return res.status(200).json({ ok: true, scheduled: true });
+  } catch (e) {
+    console.error("email inbound fatal:", e?.message || e);
+    return res.status(200).json({ ok: false });
+  }
+});
+
+app.get("/api/email/reply-jobs", requireAdmin, async (req, res) => {
+  const limit = Math.min(Number(req.query.limit || 50), 200);
+  const items = await emailReplyJobs.find({})
+    .sort({ createdAt: -1 })
+    .limit(limit)
+    .toArray();
+  res.json({ items });
+});
+
+
+
 // Health
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 // Boot
 initDb()
-  .then(() => {
+  .then(async () => {
+    await verifySmtp();
     startReplyWorker();
     startOutboundWorker();
+    startEmailWorker();
+    startEmailReplyWorker();
     app.listen(PORT, () => console.log(`✅ Server listening on :${PORT}`));
   })
   .catch((e) => {
