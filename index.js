@@ -46,6 +46,42 @@ const FAQ_DIRECT_THRESHOLD = Number(process.env.FAQ_DIRECT_THRESHOLD || 2.5);
 const OUTBOUND_SPACING_MS = Number(process.env.OUTBOUND_SPACING_MS || 5000); // 5 seconds default
 const OUTBOUND_WORKER_POLL_MS = Number(process.env.OUTBOUND_WORKER_POLL_MS || 1000);
 
+const MAILGUN_API_KEY = process.env.MAILGUN_API_KEY;
+const MAILGUN_DOMAIN = process.env.MAILGUN_DOMAIN;
+const MAILGUN_FROM = process.env.MAILGUN_FROM;
+const MAILGUN_BASE_URL = process.env.MAILGUN_BASE_URL || "https://api.mailgun.net";
+
+async function sendEmailViaMailgun({ to, subject, text, html, headers }) {
+  if (!MAILGUN_API_KEY || !MAILGUN_DOMAIN || !MAILGUN_FROM) {
+    throw new Error("mailgun_not_configured");
+  }
+
+  const url = `${MAILGUN_BASE_URL}/v3/${MAILGUN_DOMAIN}/messages`;
+
+  const params = new URLSearchParams();
+  params.append("from", MAILGUN_FROM);
+  params.append("to", to);
+  params.append("subject", subject || "");
+  if (text) params.append("text", text);
+  if (html) params.append("html", html);
+
+  // Custom headers for threading etc (Mailgun uses h:Header-Name)
+  if (headers && typeof headers === "object") {
+    for (const [k, v] of Object.entries(headers)) {
+      if (v) params.append(`h:${k}`, String(v));
+    }
+  }
+
+  const resp = await axios.post(url, params, {
+    auth: { username: "api", password: MAILGUN_API_KEY },
+    timeout: 60000,
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+  });
+
+  return resp.data; // includes id, message
+}
+
+
 if (!NOTIF_CLIENT_ID || !NOTIF_CLIENT_SECRET) throw new Error("Missing NOTIF_CLIENT_ID / NOTIF_CLIENT_SECRET");
 if (!NOTIF_INBOUND_WEBHOOK_SECRET) throw new Error("Missing NOTIF_INBOUND_WEBHOOK_SECRET");
 if (!process.env.EMAIL_INBOUND_WEBHOOK_SECRET) throw new Error("Missing EMAIL_INBOUND_WEBHOOK_SECRET");
@@ -445,48 +481,6 @@ function isLowValueClosingMessage(text = "") {
 function normalizeEmailUserId(email) {
   return String(email || "").trim().toLowerCase();
 }
-
-async function sendEmailViaMailgun({ to, subject, text, html, trackingId }) {
-  const apiKey = process.env.MAILGUN_API_KEY;
-  const domain = process.env.MAILGUN_DOMAIN;
-  const from = process.env.MAILGUN_FROM;
-  const region = (process.env.MAILGUN_REGION || "us").toLowerCase();
-
-  if (!apiKey || !domain || !from) throw new Error("mailgun_not_configured");
-
-  const base =
-    region === "eu"
-      ? "https://api.eu.mailgun.net/v3"
-      : "https://api.mailgun.net/v3";
-
-  const url = `${base}/${domain}/messages`;
-
-  const params = new URLSearchParams();
-  params.append("from", from);
-  params.append("to", to);
-  params.append("subject", subject);
-  params.append("text", text || "");
-  if (html) params.append("html", html);
-
-  // Optional but useful for debugging + matching queue records:
-  if (trackingId) params.append("v:trackingId", trackingId);
-
-  // Recommended headers:
-  // params.append("h:Reply-To", "support@yourdomain.com");
-
-  const auth = Buffer.from(`api:${apiKey}`).toString("base64");
-
-  const resp = await axios.post(url, params, {
-    headers: {
-      Authorization: `Basic ${auth}`,
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    timeout: 60000,
-  });
-
-  return resp.data; // contains id, message, etc
-}
-
 
 
 
@@ -922,14 +916,12 @@ async function processOneEmailJob() {
     // choose ONE sender (pick your path)
     // await sendEmailViaSendGrid({ to: job.email, subject: job.subject, text: job.body });
     // await sendEmailViaSMTP({ to: job.email, subject: job.subject, text: job.body });
-    await sendEmailViaMailgun({
+await sendEmailViaMailgun({
   to: job.email,
   subject: job.subject,
   text: job.textBody || job.body,
   html: job.htmlBody || undefined,
-  trackingId: job.trackingId,
 });
-
 
     await emailQueue.updateOne(
       { _id: job._id },
@@ -943,18 +935,34 @@ async function processOneEmailJob() {
 
     return true;
   } catch (e) {
-    await emailQueue.updateOne(
-      { _id: job._id },
-      { $set: { status: "failed", failedAt: new Date(), error: String(e?.message || e) } }
-    );
+  const status = e?.response?.status;
+  const data = e?.response?.data;
+  const detail =
+    data ? JSON.stringify(data) :
+    (e?.message || String(e));
 
-    await emailBatches.updateOne(
-      { _id: job.batchId },
-      { $inc: { failed: 1 }, $set: { updatedAt: new Date() } }
-    );
+  console.error("❌ Mailgun send failed:", { status, detail });
 
-    return true;
-  }
+  await emailQueue.updateOne(
+    { _id: job._id },
+    {
+      $set: {
+        status: "failed",
+        failedAt: new Date(),
+        error: detail,
+        errorStatus: status || null,
+      }
+    }
+  );
+
+  await emailBatches.updateOne(
+    { _id: job.batchId },
+    { $inc: { failed: 1 }, $set: { updatedAt: new Date() } }
+  );
+
+  return true;
+}
+
 }
 
 function startEmailWorker() {
