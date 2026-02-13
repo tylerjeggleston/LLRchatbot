@@ -385,7 +385,7 @@ async function sendEmailViaMailgun({ to, subject, text, trackingId }) {
     "o:tag": trackingId ? ["email-blast", String(trackingId).slice(0, 128)] : ["email-blast"],
 
     // Mailgun supports custom headers via h: prefix
-    "h:List-Unsubscribe": "<mailto:unsubscribe@getleadslockerroom.com?subject=unsubscribe>",
+    "h:List-Unsubscribe": "<mailto:unsubscribe@mg.leadlockerroom.com?subject=unsubscribe>",
     "h:List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
   };
 
@@ -886,7 +886,7 @@ async function sendEmailViaSendGrid({ to, subject, text, trackingId }) {
 
     // Optional: one-click unsubscribe headers (extra-safe)
     headers: {
-      "List-Unsubscribe": "<mailto:unsubscribe@leadslockerroom.com?subject=unsubscribe>",
+      "List-Unsubscribe": "<mailto:unsubscribe@mg.leadslockerroom.com?subject=unsubscribe>",
       "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
     },
   };
