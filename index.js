@@ -840,7 +840,7 @@ const SMTP_HOST = process.env.SMTP_HOST;
 const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
 const SMTP_USER = process.env.SMTP_USER;
 const SMTP_PASS = process.env.SMTP_PASS;
-const EMAIL_FROM = process.env.EMAIL_FROM || SMTP_USER;
+const EMAIL_FROM = "tyler@mg.leadslockerroom.com";
 
 const smtpTransport =
   SMTP_HOST && SMTP_USER && SMTP_PASS
