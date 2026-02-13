@@ -6,10 +6,12 @@ const cors = require("cors");
 const axios = require("axios");
 const { MongoClient, ObjectId } = require("mongodb");
 const notificationapi = require("notificationapi-node-server-sdk").default;
-
+const sgMail = require("@sendgrid/mail");
 const nodemailer = require("nodemailer");
 const multer = require("multer");
 const upload = multer();
+const Mailgun = require("mailgun.js");
+const formData = require("form-data");
 
 
 
@@ -41,6 +43,31 @@ const MONGODB_DB = process.env.MONGODB_DB || "llrchatbot";
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY || ""; // optional
 const REPLY_DELAY_MS = Number(process.env.REPLY_DELAY_MS || 15000);
 const FAQ_DIRECT_THRESHOLD = Number(process.env.FAQ_DIRECT_THRESHOLD || 2.5);
+
+const EMAIL_PROVIDER = "mailgun"
+
+const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY;
+const SENDGRID_FROM_EMAIL = process.env.SENDGRID_FROM_EMAIL;
+const SENDGRID_ASM_GROUP_ID = Number(process.env.SENDGRID_ASM_GROUP_ID || 0);
+
+const EMAIL_DAILY_CAP = 5000;
+const EMAIL_RATE_PER_SECOND = 2;
+
+if (SENDGRID_API_KEY) sgMail.setApiKey(SENDGRID_API_KEY);
+const MAILGUN_API_KEY = process.env.MAILGUN_API_KEY;
+const MAILGUN_DOMAIN = process.env.MAILGUN_DOMAIN;
+const MAILGUN_FROM = process.env.EMAIL_FROM;
+const MAILGUN_REGION = (process.env.MAILGUN_REGION || "US").toUpperCase();
+
+const mailgunClient =
+  MAILGUN_API_KEY
+    ? new Mailgun(formData).client({
+        username: "api",
+        key: MAILGUN_API_KEY,
+        url: MAILGUN_REGION === "EU" ? "https://api.eu.mailgun.net" : "https://api.mailgun.net",
+      })
+    : null;
+
 
 // Bulk outbound config
 const OUTBOUND_SPACING_MS = Number(process.env.OUTBOUND_SPACING_MS || 5000); // 5 seconds default
@@ -214,36 +241,6 @@ async function initDb() {
 
 // ----------------- Helpers -----------------
 
-function escapeHtml(s) {
-  return String(s || "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-}
-
-function escapeHtmlToParagraphs(text) {
-  const lines = String(text || "").split(/\r?\n/);
-  let html = "";
-  let buf = [];
-
-  for (const line of lines) {
-    if (line.trim() === "") {
-      if (buf.length) {
-        html += `<p style="margin:0 0 12px 0;">${escapeHtml(buf.join(" "))}</p>`;
-        buf = [];
-      }
-      continue;
-    }
-    buf.push(line.trim());
-  }
-
-  if (buf.length) html += `<p style="margin:0 0 12px 0;">${escapeHtml(buf.join(" "))}</p>`;
-  return html || "";
-}
-
-
 async function verifySmtp() {
   if (!smtpTransport) {
     console.log("❌ SMTP not configured");
@@ -369,6 +366,32 @@ async function processOneEmailReplyJob() {
     return true;
   }
 }
+
+async function sendEmailViaMailgun({ to, subject, text, trackingId }) {
+  if (!mailgunClient) throw new Error("mailgun_not_configured");
+  if (!MAILGUN_DOMAIN) throw new Error("mailgun_domain_missing");
+  if (!MAILGUN_FROM) throw new Error("mailgun_from_missing");
+
+  // Marketing safety basics:
+  // - include unsubscribe instructions in the body (you already do in replies)
+  // - set List-Unsubscribe headers (helps deliverability + compliance)
+  const data = {
+    from: MAILGUN_FROM,
+    to,
+    subject,
+    text,
+
+    // Optional tags + variables for tracking/debug
+    "o:tag": trackingId ? ["email-blast", String(trackingId).slice(0, 128)] : ["email-blast"],
+
+    // Mailgun supports custom headers via h: prefix
+    "h:List-Unsubscribe": "<mailto:unsubscribe@mg.leadlockerroom.com?subject=unsubscribe>",
+    "h:List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+  };
+
+  await mailgunClient.messages.create(MAILGUN_DOMAIN, data);
+}
+
 
 function startEmailReplyWorker() {
   setInterval(async () => {
@@ -808,15 +831,9 @@ function renderEmail(template, vars) {
     out = out.replaceAll(`{${k}}`, map[k]);
   }
 
-  // ✅ Only collapse repeated spaces/tabs (NOT newlines)
-  out = out.replace(/[^\S\r\n]{2,}/g, " ");
-
-  // Optional: normalize trailing spaces per line
-  out = out.replace(/[^\S\r\n]+$/gm, "");
-
-  return out.trim();
+  out = out.replace(/\s{2,}/g, " ").trim();
+  return out;
 }
-
 
 async function getEmailBlastTemplate() {
   const doc = await emailSettings.findOne({ key: "email_blast_template" });
@@ -824,23 +841,17 @@ async function getEmailBlastTemplate() {
     doc || {
       key: "email_blast_template",
       subject: "Quick question, {{firstName}}",
-      body: "Hey {{firstName}},\n\nAre you free for a quick chat?\n",
-      signatureText: "— Leads Locker Room\nleadslockerroom.com",
-      signatureHtml:
-        "— <b>Leads Locker Room</b><br/><a href='https://leadslockerroom.com'>leadslockerroom.com</a>",
-      flyerImageUrl: "",
+      body: "Hey {{firstName}},\n\nAre you free for a quick chat?\n\n- Leads Locker Room",
       enabled: true,
     }
   );
 }
 
-
-
 const SMTP_HOST = process.env.SMTP_HOST;
 const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
 const SMTP_USER = process.env.SMTP_USER;
 const SMTP_PASS = process.env.SMTP_PASS;
-const EMAIL_FROM = "tyler@mg.leadslockerroom.com";
+const EMAIL_FROM = process.env.EMAIL_FROM || SMTP_USER;
 
 const smtpTransport =
   SMTP_HOST && SMTP_USER && SMTP_PASS
@@ -852,21 +863,42 @@ const smtpTransport =
       })
     : null;
 
-async function sendEmailViaSMTP({ to, subject, text, html }) {
+async function sendEmailViaSMTP({ to, subject, text }) {
   if (!smtpTransport) throw new Error("smtp_not_configured");
-  await smtpTransport.sendMail({
-    from: EMAIL_FROM,
+  await smtpTransport.sendMail({ from: EMAIL_FROM, to, subject, text });
+}
+
+async function sendEmailViaSendGrid({ to, subject, text, trackingId }) {
+  if (!SENDGRID_API_KEY) throw new Error("sendgrid_not_configured");
+  if (!SENDGRID_FROM_EMAIL) throw new Error("sendgrid_from_missing");
+
+  const msg = {
     to,
+    from: SENDGRID_FROM_EMAIL,
     subject,
     text,
-    html,
-  });
+
+    // Unsubscribe group (promo compliance)
+    ...(SENDGRID_ASM_GROUP_ID ? { asm: { groupId: SENDGRID_ASM_GROUP_ID } } : {}),
+
+    // Helpful metadata (debug + analytics)
+    customArgs: trackingId ? { trackingId: String(trackingId) } : undefined,
+
+    // Optional: one-click unsubscribe headers (extra-safe)
+    headers: {
+      "List-Unsubscribe": "<mailto:unsubscribe@mg.leadslockerroom.com?subject=unsubscribe>",
+      "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+    },
+  };
+
+  await sgMail.send(msg);
 }
 
 
 async function processOneEmailJob() {
   const now = new Date();
 
+  // 1) claim next job first
   const claimed = await emailQueue.findOneAndUpdate(
     { status: "queued", runAt: { $lte: now } },
     { $set: { status: "processing", processingAt: now } },
@@ -874,18 +906,51 @@ async function processOneEmailJob() {
   );
 
   const job = claimed?.value ?? claimed ?? null;
-  if (!job || !job._id) return false;
+  if (!job?._id) return false;
 
+  // 2) global daily cap (UTC)
+  const todayStart = new Date();
+  todayStart.setUTCHours(0, 0, 0, 0);
+
+  const sentToday = await emailQueue.countDocuments({
+    status: "sent",
+    sentAt: { $gte: todayStart },
+  });
+
+  if (sentToday >= EMAIL_DAILY_CAP) {
+    await emailQueue.updateOne(
+      { _id: job._id },
+      { $set: { status: "skipped_daily_cap", skippedAt: new Date() } }
+    );
+
+    await emailBatches.updateOne(
+      { _id: job.batchId },
+      { $inc: { skipped: 1 }, $set: { updatedAt: new Date() } }
+    );
+
+    return true; // consumed job
+  }
+
+  // 3) send
   try {
-    // choose ONE sender (pick your path)
-    // await sendEmailViaSendGrid({ to: job.email, subject: job.subject, text: job.body });
-    // await sendEmailViaSMTP({ to: job.email, subject: job.subject, text: job.body });
-    await sendEmailViaSMTP({
-  to: job.email,
-  subject: job.subject,
-  text: job.textBody || job.body,
-  html: job.htmlBody || undefined,
-});
+    if (EMAIL_PROVIDER === "mailgun") {
+  await sendEmailViaMailgun({
+    to: job.email,
+    subject: job.subject,
+    text: job.body,
+    trackingId: job.trackingId,
+  });
+} else if (EMAIL_PROVIDER === "sendgrid") {
+  await sendEmailViaSendGrid({
+    to: job.email,
+    subject: job.subject,
+    text: job.body,
+    trackingId: job.trackingId,
+  });
+} else {
+  await sendEmailViaSMTP({ to: job.email, subject: job.subject, text: job.body });
+}
+
 
     await emailQueue.updateOne(
       { _id: job._id },
@@ -913,17 +978,21 @@ async function processOneEmailJob() {
   }
 }
 
+
 function startEmailWorker() {
+  const tickMs = Math.ceil(1000 / Math.max(1, EMAIL_RATE_PER_SECOND));
+
   setInterval(async () => {
     try {
       await processOneEmailJob();
     } catch (e) {
       console.error("Email worker tick error:", e?.message || e);
     }
-  }, 500);
+  }, tickMs);
 
-  console.log("✅ Email worker started");
+  console.log("✅ Email worker started", { tickMs, EMAIL_RATE_PER_SECOND });
 }
+
 
 
 
@@ -2614,26 +2683,18 @@ app.delete("/api/faq/:id", requireAdmin, async (req, res) => {
 });
 
 
-app.get("/api/email/template", async (req, res) => {
+app.get("/api/email/template", requireAdmin, async (req, res) => {
   const doc = await getEmailBlastTemplate();
   res.json({
     subject: doc.subject || "",
     body: doc.body || "",
-    signatureText: doc.signatureText || "",
-    signatureHtml: doc.signatureHtml || "",
-    flyerImageUrl: doc.flyerImageUrl || "",
     enabled: !!doc.enabled,
   });
 });
 
-
-
-app.post("/api/email/template", async (req, res) => {
+app.post("/api/email/template", requireAdmin, async (req, res) => {
   const subject = String(req.body?.subject || "").trim();
   const body = String(req.body?.body || "").trim();
-  const signatureText = String(req.body?.signatureText || "").trim();
-  const signatureHtml = String(req.body?.signatureHtml || "").trim();
-  const flyerImageUrl = String(req.body?.flyerImageUrl || "").trim();
   const enabled = req.body?.enabled;
 
   if (!subject) return res.status(400).json({ error: "subject_required" });
@@ -2645,9 +2706,6 @@ app.post("/api/email/template", async (req, res) => {
       $set: {
         subject,
         body,
-        signatureText,
-        signatureHtml,
-        flyerImageUrl,
         enabled: typeof enabled === "boolean" ? enabled : true,
         updatedAt: new Date(),
       },
@@ -2661,7 +2719,7 @@ app.post("/api/email/template", async (req, res) => {
 
 
 // Body: { rows: [{ email, firstName?, lastName? }], spacingMs?: number }
-app.post("/api/email/batch", async (req, res) => {
+app.post("/api/email/batch", requireAdmin, async (req, res) => {
   try {
     const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
     const spacingMs = Math.max(200, Number(req.body?.spacingMs || 800)); // keep sane
@@ -2710,26 +2768,7 @@ app.post("/api/email/batch", async (req, res) => {
       const lastName = String(r.lastName || r.lastname || "").trim();
 
       const subject = renderEmail(tpl.subject, { firstName, lastName });
-
-      const mainText = renderEmail(tpl.body, { firstName, lastName });
-      const sigText = renderEmail(tpl.signatureText || "", { firstName, lastName });
-      const textBody = [mainText, sigText].filter(Boolean).join("\n\n").trim();
-
-      // HTML version (minimal + safe)
-      const safeFlyerUrl = String(tpl.flyerImageUrl || "").trim();
-      const flyerHtml = safeFlyerUrl
-        ? `<div style="margin-top:12px;"><img src="${safeFlyerUrl}" alt="Leads Locker Room" style="max-width:600px;width:100%;height:auto;border:0;" /></div>`
-        : "";
-
-      const sigHtmlRaw = tpl.signatureHtml || "";
-      const sigHtml = renderEmail(sigHtmlRaw, { firstName, lastName });
-
-      const htmlBody =
-        `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.45;color:#111;">` +
-        `${escapeHtmlToParagraphs(mainText)}` +
-        `${sigHtml ? `<div style="margin-top:16px;">${sigHtml}</div>` : ""}` +
-        `${flyerHtml}` +
-        `</div>`;
+      const body = renderEmail(tpl.body, { firstName, lastName });
 
       const runAt = new Date(now + accepted * spacingMs);
       const trackingId = `${batchId}:${email}:${accepted}`;
@@ -2741,8 +2780,7 @@ app.post("/api/email/batch", async (req, res) => {
         firstName,
         lastName,
         subject,
-        textBody,
-        htmlBody,
+        body,
         status: "queued",
         runAt,
         createdAt: new Date(),
