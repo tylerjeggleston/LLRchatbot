@@ -51,20 +51,21 @@ const MAILGUN_DOMAIN = process.env.MAILGUN_DOMAIN;
 const MAILGUN_FROM = process.env.MAILGUN_FROM;
 const MAILGUN_BASE_URL = process.env.MAILGUN_BASE_URL || "https://api.mailgun.net";
 
-async function sendEmailViaMailgun({ to, subject, text, html, headers, from, replyTo }) {
-  if (!MAILGUN_API_KEY || !MAILGUN_DOMAIN) throw new Error("mailgun_not_configured");
+async function sendEmailViaMailgun({ to, subject, text, html, headers }) {
+  if (!MAILGUN_API_KEY || !MAILGUN_DOMAIN || !MAILGUN_FROM) {
+    throw new Error("mailgun_not_configured");
+  }
 
   const url = `${MAILGUN_BASE_URL}/v3/${MAILGUN_DOMAIN}/messages`;
 
   const params = new URLSearchParams();
-  params.append("from", from);              // <-- now dynamic
+  params.append("from", MAILGUN_FROM);
   params.append("to", to);
   params.append("subject", subject || "");
   if (text) params.append("text", text);
   if (html) params.append("html", html);
 
-  if (replyTo) params.append("h:Reply-To", replyTo);
-
+  // Custom headers for threading etc (Mailgun uses h:Header-Name)
   if (headers && typeof headers === "object") {
     for (const [k, v] of Object.entries(headers)) {
       if (v) params.append(`h:${k}`, String(v));
@@ -77,9 +78,8 @@ async function sendEmailViaMailgun({ to, subject, text, html, headers, from, rep
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
   });
 
-  return resp.data;
+  return resp.data; // includes id, message
 }
-
 
 
 if (!NOTIF_CLIENT_ID || !NOTIF_CLIENT_SECRET) throw new Error("Missing NOTIF_CLIENT_ID / NOTIF_CLIENT_SECRET");
@@ -120,7 +120,7 @@ let emailSessions;
 let emailWebhookEvents;
 let emailReplyJobs;
 
-let emailSenders;
+
 
 async function initDb() {
   await mongo.connect();
@@ -150,10 +150,6 @@ async function initDb() {
   emailWebhookEvents = db.collection("Email_Webhook_Events");
   emailReplyJobs = db.collection("Email_ReplyJobs");
 
-  emailSenders = db.collection("Email_Senders");
-
-  await emailSenders.createIndex({ email: 1 }, { unique: true });
-  await emailSenders.createIndex({ enabled: 1 });
 
   // sessions
   await sessions.createIndex({ userId: 1 }, { unique: true });
@@ -925,8 +921,6 @@ await sendEmailViaMailgun({
   subject: job.subject,
   text: job.textBody || job.body,
   html: job.htmlBody || undefined,
-  from: job.from,                // ✅ dynamic sender
-  replyTo: job.replyTo || "",    // ✅ optional
 });
 
     await emailQueue.updateOne(
@@ -2792,42 +2786,19 @@ app.post("/api/email/batch", async (req, res) => {
       const runAt = new Date(now + accepted * spacingMs);
       const trackingId = `${batchId}:${email}:${accepted}`;
 
-      const senders = await emailSenders
-        .find({ enabled: true })
-        .sort({ createdAt: 1 })
-        .toArray();
-
-        if (!senders.length) {
-        return res.status(409).json({ error: "no_enabled_senders" });
-        }
-
-
-      const sender = senders[accepted % senders.length];
-
-const fromEmail = String(sender.email || "").trim();
-const fromName = String(sender.name || "").trim();
-const from = fromName ? `${fromName} <${fromEmail}>` : fromEmail;
-
-queueDocs.push({
-  trackingId,
-  batchId,
-  email,
-  firstName,
-  lastName,
-  subject,
-  textBody,
-  htmlBody,
-
-  // ✅ sender snapshot on the job
-  senderId: sender._id,
-  from,
-  replyTo: sender.replyTo || "",
-
-  status: "queued",
-  runAt,
-  createdAt: new Date(),
-});
-
+      queueDocs.push({
+        trackingId,
+        batchId,
+        email,
+        firstName,
+        lastName,
+        subject,
+        textBody,
+        htmlBody,
+        status: "queued",
+        runAt,
+        createdAt: new Date(),
+      });
 
       accepted++;
       if (accepted >= dailyCap) break; // hard cap safety
@@ -2991,61 +2962,6 @@ app.get("/api/email/reply-jobs", requireAdmin, async (req, res) => {
   res.json({ items });
 });
 
-app.get("/api/email/senders", requireAdmin, async (req, res) => {
-  const items = await emailSenders.find({}).sort({ createdAt: -1 }).toArray();
-  res.json({ items });
-});
-
-app.post("/api/email/senders", requireAdmin, async (req, res) => {
-  const name = String(req.body?.name || "").trim();
-  const email = normalizeEmail(req.body?.email);
-  const replyTo = normalizeEmail(req.body?.replyTo || "") || "";
-  const enabled = typeof req.body?.enabled === "boolean" ? req.body.enabled : true;
-  const weight = Math.max(1, Number(req.body?.weight || 1));
-
-  if (!email) return res.status(400).json({ error: "invalid_email" });
-
-  await emailSenders.updateOne(
-    { email },
-    {
-      $set: { name, email, replyTo, enabled, weight, updatedAt: new Date() },
-      $setOnInsert: { createdAt: new Date() },
-    },
-    { upsert: true }
-  );
-
-  res.json({ ok: true });
-});
-
-app.patch("/api/email/senders/:id", requireAdmin, async (req, res) => {
-  const id = String(req.params.id || "").trim();
-  if (!ObjectId.isValid(id)) return res.status(400).json({ error: "invalid_id" });
-
-  const update = { updatedAt: new Date() };
-  if (typeof req.body?.name === "string") update.name = req.body.name.trim();
-  if (typeof req.body?.enabled === "boolean") update.enabled = req.body.enabled;
-  if (req.body?.weight !== undefined) update.weight = Math.max(1, Number(req.body.weight || 1));
-
-  if (req.body?.email !== undefined) {
-    const email = normalizeEmail(req.body.email);
-    if (!email) return res.status(400).json({ error: "invalid_email" });
-    update.email = email;
-  }
-  if (req.body?.replyTo !== undefined) {
-    const rt = normalizeEmail(req.body.replyTo) || "";
-    update.replyTo = rt;
-  }
-
-  await emailSenders.updateOne({ _id: new ObjectId(id) }, { $set: update });
-  res.json({ ok: true });
-});
-
-app.delete("/api/email/senders/:id", requireAdmin, async (req, res) => {
-  const id = String(req.params.id || "").trim();
-  if (!ObjectId.isValid(id)) return res.status(400).json({ error: "invalid_id" });
-  await emailSenders.deleteOne({ _id: new ObjectId(id) });
-  res.json({ ok: true });
-});
 
 
 // Health
