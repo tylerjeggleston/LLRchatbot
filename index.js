@@ -3085,14 +3085,14 @@ app.post("/webhook/email/inbound", upload.any(), async (req, res) => {
     );
 
     // Enqueue reply job (same pattern as SMS)
-  await emailReplyJobs.updateOne(
+await emailReplyJobs.updateOne(
   { trackingId },
   {
     $setOnInsert: {
       trackingId,
       userId,
-      customerEmail: fromEmail,     // ✅ clear name
-      inboundMailbox: toEmail || "",// ✅ which of YOUR inboxes received it
+      toEmail: fromEmail,          // ✅ the customer email (where to reply)
+      inboundToEmail: toEmail || "", // ✅ which of YOUR inboxes received it
       subject,
       messageId,
       text,
