@@ -867,20 +867,33 @@ function renderEmail(template, vars) {
 
 
 async function getEmailBlastTemplate() {
+  const defaults = {
+    key: "email_blast_template",
+    subject: "Quick question, {{firstName}}",
+    body: "Hey {{firstName}},\n\nAre you free for a quick chat?\n",
+    signatureText: "— Leads Locker Room\nleadslockerroom.com",
+    signatureHtml:
+      "— <b>Leads Locker Room</b><br/><a href='https://leadslockerroom.com'>leadslockerroom.com</a>",
+    flyerImageUrl: "",
+    enabled: true,
+  };
+
   const doc = await emailSettings.findOne({ key: "email_blast_template" });
-  return (
-    doc || {
-      key: "email_blast_template",
-      subject: "Quick question, {{firstName}}",
-      body: "Hey {{firstName}},\n\nAre you free for a quick chat?\n",
-      signatureText: "— Leads Locker Room\nleadslockerroom.com",
-      signatureHtml:
-        "— <b>Leads Locker Room</b><br/><a href='https://leadslockerroom.com'>leadslockerroom.com</a>",
-      flyerImageUrl: "",
-      enabled: true,
+
+  // ✅ merge defaults, and treat blank strings as “missing”
+  const merged = { ...defaults, ...(doc || {}) };
+
+  for (const k of ["subject", "body", "signatureText", "signatureHtml", "flyerImageUrl"]) {
+    if (typeof merged[k] === "string" && merged[k].trim() === "") {
+      merged[k] = defaults[k];
     }
-  );
+  }
+
+  if (typeof merged.enabled !== "boolean") merged.enabled = true;
+
+  return merged;
 }
+
 
 
 
