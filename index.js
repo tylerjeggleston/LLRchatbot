@@ -422,11 +422,14 @@ const sigHtmlFinal = String(sender?.signatureHtml || tpl.signatureHtml || "").tr
 const finalText =
   [replyText, sigTextFinal].filter(Boolean).join("\n\n").trim();
 
+const sigHtmlFallback = sigHtmlFinal || textSigToHtml(sigTextFinal);
+
 const finalHtml =
   `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.45;color:#111;">` +
   `${escapeHtmlToParagraphs(replyText)}` +
-  `${sigHtmlFinal ? `<div style="margin-top:16px;">${sigHtmlFinal}</div>` : ""}` +
+  `${sigHtmlFallback ? `<div style="margin-top:16px;">${sigHtmlFallback}</div>` : ""}` +
   `</div>`;
+
 
     // ✅ 5) send via Mailgun using SAME sender
     await sendEmailViaMailgun({
@@ -670,6 +673,12 @@ function extractMessageId(payload) {
   ).trim();
 }
 
+function textSigToHtml(sigText) {
+  const t = String(sigText || "").trim();
+  if (!t) return "";
+  // preserve line breaks nicely
+  return `<div style="white-space:pre-line;">${escapeHtml(t)}</div>`;
+}
 
 
 
@@ -2927,12 +2936,14 @@ const sigHtmlFinal = renderEmail(
   { firstName, lastName }
 );
 
+const sigHtmlFallback = sigHtmlFinal || textSigToHtml(sigTextFinal);
+
 const textBody = [mainText, sigTextFinal].filter(Boolean).join("\n\n").trim();
 
 const htmlBody =
   `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.45;color:#111;">` +
   `${escapeHtmlToParagraphs(mainText)}` +
-  `${sigHtmlFinal ? `<div style="margin-top:16px;">${sigHtmlFinal}</div>` : ""}` +
+  `${sigHtmlFallback ? `<div style="margin-top:16px;">${sigHtmlFallback}</div>` : ""}` +
   `${flyerHtml}` +
   `</div>`;
 
