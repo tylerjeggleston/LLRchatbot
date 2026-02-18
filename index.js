@@ -3183,10 +3183,7 @@ app.patch("/api/email/senders/:id", requireAdmin, async (req, res) => {
   if (typeof req.body?.enabled === "boolean") update.enabled = req.body.enabled;
   if (typeof req.body?.name === "string") update.name = req.body.name.trim();
   if (typeof req.body?.replyTo === "string") update.replyTo = normalizeEmail(req.body.replyTo) || "";
-  if (typeof req.body?.signature === "string" && !("signatureText" in req.body)) {
-  update.signatureText = req.body.signature.trim();
-}
-
+  if (typeof req.body?.signatureText === "string") update.signatureText = req.body.signatureText.trim();
   if (typeof req.body?.signatureHtml === "string") update.signatureHtml = req.body.signatureHtml.trim();
 
   await emailSenders.updateOne({ _id: new ObjectId(id) }, { $set: update });
