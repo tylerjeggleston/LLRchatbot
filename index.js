@@ -2914,25 +2914,28 @@ app.post("/api/email/batch", async (req, res) => {
 
       // ✅ sender signature overrides template signature
 
-      const textBody = [mainText, sigTextFinal].filter(Boolean).join("\n\n").trim();
-
-      const sigTextFinal = renderEmail(
-        (sender.signatureText || sender.signature || tpl.signatureText || ""),
-        { firstName, lastName }
-        );
-
-        const sigHtmlFinal = renderEmail(
-        (sender.signatureHtml || tpl.signatureHtml || ""),
-        { firstName, lastName }
-        );
 
 
-      const htmlBody =
-        `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.45;color:#111;">` +
-        `${escapeHtmlToParagraphs(mainText)}` +
-        `${sigHtmlFinal ? `<div style="margin-top:16px;">${sigHtmlFinal}</div>` : ""}` +
-        `${flyerHtml}` +
-        `</div>`;
+      // ✅ sender signature overrides template signature
+const sigTextFinal = renderEmail(
+  (sender.signatureText || sender.signature || tpl.signatureText || ""),
+  { firstName, lastName }
+);
+
+const sigHtmlFinal = renderEmail(
+  (sender.signatureHtml || tpl.signatureHtml || ""),
+  { firstName, lastName }
+);
+
+const textBody = [mainText, sigTextFinal].filter(Boolean).join("\n\n").trim();
+
+const htmlBody =
+  `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.45;color:#111;">` +
+  `${escapeHtmlToParagraphs(mainText)}` +
+  `${sigHtmlFinal ? `<div style="margin-top:16px;">${sigHtmlFinal}</div>` : ""}` +
+  `${flyerHtml}` +
+  `</div>`;
+
 
       const runAt = new Date(now + accepted * spacingMs);
       const trackingId = `${batchId}:${email}:${accepted}`;
