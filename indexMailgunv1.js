@@ -51,28 +51,20 @@ const MAILGUN_DOMAIN = process.env.MAILGUN_DOMAIN;
 const MAILGUN_FROM = process.env.MAILGUN_FROM;
 const MAILGUN_BASE_URL = process.env.MAILGUN_BASE_URL || "https://api.mailgun.net";
 
-
-
-async function sendEmailViaMailgun({ from, to, subject, text, html, headers }) {
-  if (!MAILGUN_API_KEY || !MAILGUN_DOMAIN) {
-    throw new Error("mailgun_not_configured");
-  }
+async function sendEmailViaMailgun({ to, subject, text, html, headers, from, replyTo }) {
+  if (!MAILGUN_API_KEY || !MAILGUN_DOMAIN) throw new Error("mailgun_not_configured");
 
   const url = `${MAILGUN_BASE_URL}/v3/${MAILGUN_DOMAIN}/messages`;
 
   const params = new URLSearchParams();
-
-  // ✅ allow per-message FROM (falls back to env)
-  const fromFinal = String(from || MAILGUN_FROM || "").trim();
-  if (!fromFinal) throw new Error("mailgun_from_missing");
-
-  params.append("from", fromFinal);
+  params.append("from", from);              // <-- now dynamic
   params.append("to", to);
   params.append("subject", subject || "");
   if (text) params.append("text", text);
   if (html) params.append("html", html);
 
-  // Custom headers (Mailgun uses h:Header-Name)
+  if (replyTo) params.append("h:Reply-To", replyTo);
+
   if (headers && typeof headers === "object") {
     for (const [k, v] of Object.entries(headers)) {
       if (v) params.append(`h:${k}`, String(v));
@@ -929,14 +921,13 @@ async function processOneEmailJob() {
     // await sendEmailViaSendGrid({ to: job.email, subject: job.subject, text: job.body });
     // await sendEmailViaSMTP({ to: job.email, subject: job.subject, text: job.body });
 await sendEmailViaMailgun({
-  from: job.from,                 // ✅ per-sender from
   to: job.email,
   subject: job.subject,
   text: job.textBody || job.body,
   html: job.htmlBody || undefined,
-  headers: job.replyTo ? { "Reply-To": job.replyTo } : undefined, // ✅ per-sender reply-to
+  from: job.from,                // ✅ dynamic sender
+  replyTo: job.replyTo || "",    // ✅ optional
 });
-
 
     await emailQueue.updateOne(
       { _id: job._id },
@@ -2727,10 +2718,11 @@ app.post("/api/email/template", async (req, res) => {
 });
 
 
+// Body: { rows: [{ email, firstName?, lastName? }], spacingMs?: number }
 app.post("/api/email/batch", async (req, res) => {
   try {
     const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
-    const spacingMs = Math.max(200, Number(req.body?.spacingMs || 800));
+    const spacingMs = Math.max(200, Number(req.body?.spacingMs || 800)); // keep sane
     const dailyCap = Math.max(1, Number(req.body?.dailyCap || 5000));
 
     if (!rows.length) return res.status(400).json({ error: "rows_required" });
@@ -2738,26 +2730,6 @@ app.post("/api/email/batch", async (req, res) => {
 
     const tpl = await getEmailBlastTemplate();
     if (!tpl.enabled) return res.status(409).json({ error: "email_template_disabled" });
-
-    // ✅ fetch enabled senders ONCE
-    const enabledSenders = await emailSenders
-      .find({ enabled: true })
-      .sort({ createdAt: 1 })
-      .toArray();
-
-    if (!enabledSenders.length) {
-      return res.status(409).json({ error: "no_enabled_senders" });
-    }
-
-    const senderMode = String(req.body?.senderMode || "auto"); // "auto" | "single"
-    const senderIdRaw = String(req.body?.senderId || "").trim();
-
-    let singleSender = null;
-    if (senderMode === "single") {
-      if (!ObjectId.isValid(senderIdRaw)) return res.status(400).json({ error: "invalid_senderId" });
-      singleSender = enabledSenders.find(s => String(s._id) === senderIdRaw) || null;
-      if (!singleSender) return res.status(409).json({ error: "sender_not_found_or_disabled" });
-    }
 
     const batchId = new ObjectId().toString();
     const now = Date.now();
@@ -2773,8 +2745,6 @@ app.post("/api/email/batch", async (req, res) => {
       skipped: 0,
       spacingMs,
       dailyCap,
-      senderMode,
-      senderId: singleSender ? String(singleSender._id) : null,
       createdAt: new Date(),
       updatedAt: new Date(),
     });
@@ -2798,63 +2768,69 @@ app.post("/api/email/batch", async (req, res) => {
       const lastName = String(r.lastName || r.lastname || "").trim();
 
       const subject = renderEmail(tpl.subject, { firstName, lastName });
-      const mainText = renderEmail(tpl.body, { firstName, lastName });
 
-      // flyer
+      const mainText = renderEmail(tpl.body, { firstName, lastName });
+      const sigText = renderEmail(tpl.signatureText || "", { firstName, lastName });
+      const textBody = [mainText, sigText].filter(Boolean).join("\n\n").trim();
+
+      // HTML version (minimal + safe)
       const safeFlyerUrl = String(tpl.flyerImageUrl || "").trim();
       const flyerHtml = safeFlyerUrl
         ? `<div style="margin-top:12px;"><img src="${safeFlyerUrl}" alt="Leads Locker Room" style="max-width:600px;width:100%;height:auto;border:0;" /></div>`
         : "";
 
-      // ✅ pick sender
-      const sender = singleSender || enabledSenders[accepted % enabledSenders.length];
-
-      const fromEmail = String(sender.email || "").trim();
-      const fromName = String(sender.name || "").trim();
-      const from = fromName ? `${fromName} <${fromEmail}>` : fromEmail;
-
-      const replyTo = String(sender.replyTo || "").trim();
-
-      // ✅ sender signature overrides template signature
-      const sigTextFinal = renderEmail(sender.signatureText || tpl.signatureText || "", { firstName, lastName });
-      const textBody = [mainText, sigTextFinal].filter(Boolean).join("\n\n").trim();
-
-      const sigHtmlFinal = renderEmail(sender.signatureHtml || tpl.signatureHtml || "", { firstName, lastName });
+      const sigHtmlRaw = tpl.signatureHtml || "";
+      const sigHtml = renderEmail(sigHtmlRaw, { firstName, lastName });
 
       const htmlBody =
         `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.45;color:#111;">` +
         `${escapeHtmlToParagraphs(mainText)}` +
-        `${sigHtmlFinal ? `<div style="margin-top:16px;">${sigHtmlFinal}</div>` : ""}` +
+        `${sigHtml ? `<div style="margin-top:16px;">${sigHtml}</div>` : ""}` +
         `${flyerHtml}` +
         `</div>`;
 
       const runAt = new Date(now + accepted * spacingMs);
       const trackingId = `${batchId}:${email}:${accepted}`;
 
-      queueDocs.push({
-        trackingId,
-        batchId,
-        email,
-        firstName,
-        lastName,
-        subject,
+      const senders = await emailSenders
+        .find({ enabled: true })
+        .sort({ createdAt: 1 })
+        .toArray();
 
-        // ✅ store final bodies
-        textBody,
-        htmlBody,
+        if (!senders.length) {
+        return res.status(409).json({ error: "no_enabled_senders" });
+        }
 
-        // ✅ store sender identity for the worker
-        senderId: String(sender._id),
-        from,
-        replyTo,
 
-        status: "queued",
-        runAt,
-        createdAt: new Date(),
-      });
+      const sender = senders[accepted % senders.length];
+
+const fromEmail = String(sender.email || "").trim();
+const fromName = String(sender.name || "").trim();
+const from = fromName ? `${fromName} <${fromEmail}>` : fromEmail;
+
+queueDocs.push({
+  trackingId,
+  batchId,
+  email,
+  firstName,
+  lastName,
+  subject,
+  textBody,
+  htmlBody,
+
+  // ✅ sender snapshot on the job
+  senderId: sender._id,
+  from,
+  replyTo: sender.replyTo || "",
+
+  status: "queued",
+  runAt,
+  createdAt: new Date(),
+});
+
 
       accepted++;
-      if (accepted >= dailyCap) break;
+      if (accepted >= dailyCap) break; // hard cap safety
     }
 
     if (queueDocs.length) {
@@ -2882,15 +2858,12 @@ app.post("/api/email/batch", async (req, res) => {
       rejects: rejects.slice(0, 50),
       spacingMs,
       dailyCap,
-      senderMode,
-      senderId: singleSender ? String(singleSender._id) : null,
     });
   } catch (e) {
     console.error("email/batch error:", e);
-    res.status(500).json({ error: e?.message || "failed" });
+    res.status(500).json({ error: "failed" });
   }
 });
-
 
 app.get("/api/email/batch/:batchId", requireAdmin, async (req, res) => {
   const doc = await emailBatches.findOne({ _id: req.params.batchId });
@@ -3019,38 +2992,23 @@ app.get("/api/email/reply-jobs", requireAdmin, async (req, res) => {
 });
 
 app.get("/api/email/senders", requireAdmin, async (req, res) => {
-  const items = await emailSenders
-    .find({})
-    .sort({ enabled: -1, createdAt: -1 })
-    .toArray();
+  const items = await emailSenders.find({}).sort({ createdAt: -1 }).toArray();
   res.json({ items });
 });
-
 
 app.post("/api/email/senders", requireAdmin, async (req, res) => {
   const name = String(req.body?.name || "").trim();
   const email = normalizeEmail(req.body?.email);
-  const replyTo = normalizeEmail(req.body?.replyTo) || "";
+  const replyTo = normalizeEmail(req.body?.replyTo || "") || "";
   const enabled = typeof req.body?.enabled === "boolean" ? req.body.enabled : true;
-
-  // NEW signature fields (text + html)
-  const signatureText = String(req.body?.signatureText || "").trim();
-  const signatureHtml = String(req.body?.signatureHtml || "").trim();
+  const weight = Math.max(1, Number(req.body?.weight || 1));
 
   if (!email) return res.status(400).json({ error: "invalid_email" });
 
   await emailSenders.updateOne(
     { email },
     {
-      $set: {
-        name,
-        email,
-        replyTo,
-        enabled,
-        signatureText,
-        signatureHtml,
-        updatedAt: new Date(),
-      },
+      $set: { name, email, replyTo, enabled, weight, updatedAt: new Date() },
       $setOnInsert: { createdAt: new Date() },
     },
     { upsert: true }
@@ -3059,28 +3017,32 @@ app.post("/api/email/senders", requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
-
 app.patch("/api/email/senders/:id", requireAdmin, async (req, res) => {
-  const id = String(req.params.id || "");
+  const id = String(req.params.id || "").trim();
   if (!ObjectId.isValid(id)) return res.status(400).json({ error: "invalid_id" });
 
   const update = { updatedAt: new Date() };
-
-  if (typeof req.body?.enabled === "boolean") update.enabled = req.body.enabled;
   if (typeof req.body?.name === "string") update.name = req.body.name.trim();
-  if (typeof req.body?.replyTo === "string") update.replyTo = normalizeEmail(req.body.replyTo) || "";
-  if (typeof req.body?.signatureText === "string") update.signatureText = req.body.signatureText.trim();
-  if (typeof req.body?.signatureHtml === "string") update.signatureHtml = req.body.signatureHtml.trim();
+  if (typeof req.body?.enabled === "boolean") update.enabled = req.body.enabled;
+  if (req.body?.weight !== undefined) update.weight = Math.max(1, Number(req.body.weight || 1));
+
+  if (req.body?.email !== undefined) {
+    const email = normalizeEmail(req.body.email);
+    if (!email) return res.status(400).json({ error: "invalid_email" });
+    update.email = email;
+  }
+  if (req.body?.replyTo !== undefined) {
+    const rt = normalizeEmail(req.body.replyTo) || "";
+    update.replyTo = rt;
+  }
 
   await emailSenders.updateOne({ _id: new ObjectId(id) }, { $set: update });
   res.json({ ok: true });
 });
 
-
 app.delete("/api/email/senders/:id", requireAdmin, async (req, res) => {
-  const id = String(req.params.id || "");
+  const id = String(req.params.id || "").trim();
   if (!ObjectId.isValid(id)) return res.status(400).json({ error: "invalid_id" });
-
   await emailSenders.deleteOne({ _id: new ObjectId(id) });
   res.json({ ok: true });
 });
