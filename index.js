@@ -871,9 +871,9 @@ async function getEmailBlastTemplate() {
     key: "email_blast_template",
     subject: "Quick question, {{firstName}}",
     body: "Hey {{firstName}},\n\nAre you free for a quick chat?\n",
-    signatureText: "— Leads Locker Room\nleadslockerroom.com",
+    signatureText: "— Leads Locker Room\ngetleads.leadslockerroom.com",
     signatureHtml:
-      "— <b>Leads Locker Room</b><br/><a href='https://leadslockerroom.com'>leadslockerroom.com</a>",
+      "— <b>Leads Locker Room</b><br/><a href='https://getleads.leadslockerroom.com'>getleads.leadslockerroom.com</a>",
     flyerImageUrl: "",
     enabled: true,
   };
