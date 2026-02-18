@@ -78,6 +78,10 @@ async function sendEmailViaMailgun({ from, to, subject, text, html, headers }) {
       if (v) params.append(`h:${k}`, String(v));
     }
   }
+    // ✅ extra tracing headers
+  if (headers?.["X-LLR-Sender-Id"]) params.append("h:X-LLR-Sender-Id", String(headers["X-LLR-Sender-Id"]));
+  if (headers?.["X-LLR-Sender-Email"]) params.append("h:X-LLR-Sender-Email", String(headers["X-LLR-Sender-Email"]));
+
 
   const resp = await axios.post(url, params, {
     auth: { username: "api", password: MAILGUN_API_KEY },
@@ -381,20 +385,72 @@ async function processOneEmailReplyJob() {
     }
 
     // Add signature (keep stable)
-    const finalBody =
-      `${replyText}\n\n— Leads Locker Room\nIf you want no more emails, reply “unsubscribe”.`;
+    // ✅ 1) load template (fallback sigs)
+const tpl = await getEmailBlastTemplate();
 
-    // IMPORTANT: preserve threading (if you have messageId)
-    // Nodemailer supports headers:
-    await smtpTransport.sendMail({
-      from: EMAIL_FROM,
-      to: job.toEmail,
-      subject: job.subject?.toLowerCase().startsWith("re:") ? job.subject : `Re: ${job.subject || "Quick question"}`,
-      text: finalBody,
-      headers: job.messageId
-        ? { "In-Reply-To": job.messageId, "References": job.messageId }
-        : undefined,
+// ✅ 2) choose sender that received the inbound
+let sender = null;
+
+// Prefer inboundToEmail (most reliable)
+if (job.inboundToEmail) {
+  sender = await emailSenders.findOne({ email: normalizeEmail(job.inboundToEmail) });
+}
+
+// If not found, fallback: try to decode from message headers you injected
+// (Sometimes providers include your custom header in inbound payload; not always)
+if (!sender && job.senderId && ObjectId.isValid(job.senderId)) {
+  sender = await emailSenders.findOne({ _id: new ObjectId(job.senderId) });
+}
+
+// If still not found, final fallback: first enabled sender (don’t block replies)
+if (!sender) {
+  sender = await emailSenders.findOne({ enabled: true }, { sort: { createdAt: 1 } });
+}
+
+const fromEmail = String(sender?.email || "").trim();
+const fromName = String(sender?.name || "").trim();
+const from = fromName ? `${fromName} <${fromEmail}>` : fromEmail;
+
+const replyTo = String(sender?.replyTo || "").trim();
+
+// ✅ 3) signature: sender override, else template fallback
+const sigTextFinal = String(sender?.signatureText || tpl.signatureText || "").trim();
+const sigHtmlFinal = String(sender?.signatureHtml || tpl.signatureHtml || "").trim();
+
+// ✅ 4) final bodies
+const finalText =
+  [replyText, sigTextFinal].filter(Boolean).join("\n\n").trim();
+
+const finalHtml =
+  `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.45;color:#111;">` +
+  `${escapeHtmlToParagraphs(replyText)}` +
+  `${sigHtmlFinal ? `<div style="margin-top:16px;">${sigHtmlFinal}</div>` : ""}` +
+  `</div>`;
+
+    // ✅ 5) send via Mailgun using SAME sender
+    await sendEmailViaMailgun({
+    from,
+    to: job.toEmail,
+    subject: job.subject?.toLowerCase().startsWith("re:") ? job.subject : `Re: ${job.subject || "Quick question"}`,
+    text: finalText,
+    html: finalHtml,
+    headers: {
+        ...(replyTo ? { "Reply-To": replyTo } : {}),
+        ...(job.messageId ? { "In-Reply-To": job.messageId, "References": job.messageId } : {}),
+        "X-LLR-Sender-Id": String(sender?._id || ""),
+        "X-LLR-Sender-Email": fromEmail,
+    },
     });
+
+    // ✅ Save outbound in session (store the actual body you sent)
+    await emailSessions.updateOne(
+    { userId: job.userId },
+    {
+        $set: { updatedAt: new Date() },
+        $push: { history: { $each: [{ role: "assistant", content: finalText, createdAt: new Date() }], $slice: -50 } }
+    }
+    );
+
 
     // Save outbound in session
     await emailSessions.updateOne(
@@ -538,6 +594,33 @@ function extractFromEmail(payload) {
 
   return null;
 }
+
+function extractToEmail(payload) {
+  const direct =
+    payload.recipient ||
+    payload.to ||
+    payload.To ||
+    payload["to"] ||
+    payload["to_email"] ||
+    payload["recipient-email"] ||
+    payload["Delivered-To"];
+
+  if (direct) {
+    const m = String(direct).match(/<([^>]+)>/);
+    const raw = m ? m[1] : direct;
+    return normalizeEmail(raw);
+  }
+
+  // Mailgun commonly gives "recipient"
+  if (payload.envelope) {
+    const env = typeof payload.envelope === "string" ? safeJsonParse(payload.envelope) : payload.envelope;
+    const to = Array.isArray(env?.to) ? env.to[0] : env?.to;
+    if (to) return normalizeEmail(to);
+  }
+
+  return null;
+}
+
 
 function extractEmailText(payload) {
   // Try common plain-text fields first
@@ -942,13 +1025,19 @@ async function processOneEmailJob() {
     // await sendEmailViaSendGrid({ to: job.email, subject: job.subject, text: job.body });
     // await sendEmailViaSMTP({ to: job.email, subject: job.subject, text: job.body });
 await sendEmailViaMailgun({
-  from: job.from,                 // ✅ per-sender from
+  from: job.from,
   to: job.email,
   subject: job.subject,
   text: job.textBody || job.body,
   html: job.htmlBody || undefined,
-  headers: job.replyTo ? { "Reply-To": job.replyTo } : undefined, // ✅ per-sender reply-to
+  headers: {
+    ...(job.replyTo ? { "Reply-To": job.replyTo } : {}),
+    "X-LLR-Sender-Id": job.senderId || "",
+    "X-LLR-Sender-Email": (String(job.from || "").match(/<([^>]+)>/)?.[1] || job.from || ""),
+  },
 });
+
+
 
 
     await emailQueue.updateOne(
@@ -2874,6 +2963,16 @@ app.post("/api/email/batch", async (req, res) => {
       await emailQueue.insertMany(queueDocs, { ordered: false });
     }
 
+    await emailSessions.updateOne(
+  { userId: normalizeEmailUserId(email) },
+  {
+    $setOnInsert: { userId: normalizeEmailUserId(email), createdAt: new Date() },
+    $set: { lastSenderId: String(sender._id), lastSenderEmail: String(sender.email), updatedAt: new Date() }
+  },
+  { upsert: true }
+);
+
+
     await emailBatches.updateOne(
       { _id: batchId },
       {
@@ -2937,6 +3036,8 @@ app.post("/webhook/email/inbound", upload.any(), async (req, res) => {
 
     // Provider fields differ. You must map these:
     const fromEmail = extractFromEmail(payload);
+    const toEmail = extractToEmail(payload); // ✅ the sender inbox that got the inbound
+
     const subject = String(payload.subject || payload.Subject || payload["subject"] || "").trim();
 
     const text = extractEmailText(payload);
@@ -2998,22 +3099,25 @@ app.post("/webhook/email/inbound", upload.any(), async (req, res) => {
 
     // Enqueue reply job (same pattern as SMS)
     await emailReplyJobs.updateOne(
-      { trackingId },
-      {
-        $setOnInsert: {
-          trackingId,
-          userId,
-          toEmail: fromEmail,
-          subject,
-          messageId,
-          text,
-          status: "queued",
-          runAt: new Date(Date.now() + 10_000),
-          createdAt: new Date(),
-        },
-      },
-      { upsert: true }
-    );
+  { trackingId },
+  {
+    $setOnInsert: {
+      trackingId,
+      userId,
+      toEmail: fromEmail,
+      subject,
+      messageId,
+      text,
+      // ✅ add this
+      inboundToEmail: toEmail || "",
+      status: "queued",
+      runAt: new Date(Date.now() + 10_000),
+      createdAt: new Date(),
+    },
+  },
+  { upsert: true }
+);
+
 
     return res.status(200).json({ ok: true, scheduled: true });
   } catch (e) {
