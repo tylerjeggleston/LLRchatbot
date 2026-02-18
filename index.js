@@ -950,28 +950,28 @@ async function getEmailBlastTemplate() {
     key: "email_blast_template",
     subject: "Quick question, {{firstName}}",
     body: "Hey {{firstName}},\n\nAre you free for a quick chat?\n",
-    signatureText: "— Leads Locker Room\ngetleads.leadslockerroom.com",
-    signatureHtml:
-      "— <b>Leads Locker Room</b><br/><a href='https://getleads.leadslockerroom.com'>getleads.leadslockerroom.com</a>",
+    signatureText: "",          // <-- default blank
+    signatureHtml: "",          // <-- default blank
     flyerImageUrl: "",
     enabled: true,
   };
 
   const doc = await emailSettings.findOne({ key: "email_blast_template" });
-
-  // ✅ merge defaults, and treat blank strings as “missing”
   const merged = { ...defaults, ...(doc || {}) };
 
-  for (const k of ["subject", "body", "signatureText", "signatureHtml", "flyerImageUrl"]) {
+  // only backfill subject/body/flyer if blank
+  for (const k of ["subject", "body", "flyerImageUrl"]) {
     if (typeof merged[k] === "string" && merged[k].trim() === "") {
       merged[k] = defaults[k];
     }
   }
 
+  // DO NOT backfill signature fields — blank should mean “no template signature”
   if (typeof merged.enabled !== "boolean") merged.enabled = true;
 
   return merged;
 }
+
 
 
 
