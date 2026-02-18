@@ -414,8 +414,9 @@ const from = fromName ? `${fromName} <${fromEmail}>` : fromEmail;
 const replyTo = String(sender?.replyTo || "").trim();
 
 // ✅ 3) signature: sender override, else template fallback
-const sigTextFinal = String(sender?.signatureText || tpl.signatureText || "").trim();
+const sigTextFinal = String(sender?.signatureText || sender?.signature || tpl.signatureText || "").trim();
 const sigHtmlFinal = String(sender?.signatureHtml || tpl.signatureHtml || "").trim();
+
 
 // ✅ 4) final bodies
 const finalText =
@@ -2912,10 +2913,19 @@ app.post("/api/email/batch", async (req, res) => {
       const replyTo = String(sender.replyTo || "").trim();
 
       // ✅ sender signature overrides template signature
-      const sigTextFinal = renderEmail(sender.signatureText || tpl.signatureText || "", { firstName, lastName });
+
       const textBody = [mainText, sigTextFinal].filter(Boolean).join("\n\n").trim();
 
-      const sigHtmlFinal = renderEmail(sender.signatureHtml || tpl.signatureHtml || "", { firstName, lastName });
+      const sigTextFinal = renderEmail(
+        (sender.signatureText || sender.signature || tpl.signatureText || ""),
+        { firstName, lastName }
+        );
+
+        const sigHtmlFinal = renderEmail(
+        (sender.signatureHtml || tpl.signatureHtml || ""),
+        { firstName, lastName }
+        );
+
 
       const htmlBody =
         `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.45;color:#111;">` +
@@ -3136,7 +3146,9 @@ app.post("/api/email/senders", requireAdmin, async (req, res) => {
   const enabled = typeof req.body?.enabled === "boolean" ? req.body.enabled : true;
 
   // NEW signature fields (text + html)
-  const signatureText = String(req.body?.signatureText || "").trim();
+  const signatureText =
+  String(req.body?.signatureText || req.body?.signature || "").trim();
+
   const signatureHtml = String(req.body?.signatureHtml || "").trim();
 
   if (!email) return res.status(400).json({ error: "invalid_email" });
@@ -3171,7 +3183,10 @@ app.patch("/api/email/senders/:id", requireAdmin, async (req, res) => {
   if (typeof req.body?.enabled === "boolean") update.enabled = req.body.enabled;
   if (typeof req.body?.name === "string") update.name = req.body.name.trim();
   if (typeof req.body?.replyTo === "string") update.replyTo = normalizeEmail(req.body.replyTo) || "";
-  if (typeof req.body?.signatureText === "string") update.signatureText = req.body.signatureText.trim();
+  if (typeof req.body?.signature === "string" && !("signatureText" in req.body)) {
+  update.signatureText = req.body.signature.trim();
+}
+
   if (typeof req.body?.signatureHtml === "string") update.signatureHtml = req.body.signatureHtml.trim();
 
   await emailSenders.updateOne({ _id: new ObjectId(id) }, { $set: update });
