@@ -444,22 +444,18 @@ const finalHtml =
 
     // ✅ Save outbound in session (store the actual body you sent)
     await emailSessions.updateOne(
-    { userId: job.userId },
-    {
-        $set: { updatedAt: new Date() },
-        $push: { history: { $each: [{ role: "assistant", content: finalText, createdAt: new Date() }], $slice: -50 } }
-    }
-    );
-
-
-    // Save outbound in session
-    await emailSessions.updateOne(
-      { userId: job.userId },
-      {
-        $set: { updatedAt: new Date() },
-        $push: { history: { $each: [{ role: "assistant", content: finalBody, createdAt: new Date() }], $slice: -50 } }
+  { userId: job.userId },
+  {
+    $set: { updatedAt: new Date() },
+    $push: {
+      history: {
+        $each: [{ role: "assistant", content: finalText, createdAt: new Date() }],
+        $slice: -50
       }
-    );
+    }
+  }
+);
+
 
     await emailReplyJobs.updateOne({ _id: job._id }, { $set: { status: "done", doneAt: new Date() } });
     return true;
@@ -2963,15 +2959,6 @@ app.post("/api/email/batch", async (req, res) => {
       await emailQueue.insertMany(queueDocs, { ordered: false });
     }
 
-    await emailSessions.updateOne(
-  { userId: normalizeEmailUserId(email) },
-  {
-    $setOnInsert: { userId: normalizeEmailUserId(email), createdAt: new Date() },
-    $set: { lastSenderId: String(sender._id), lastSenderEmail: String(sender.email), updatedAt: new Date() }
-  },
-  { upsert: true }
-);
-
 
     await emailBatches.updateOne(
       { _id: batchId },
@@ -3098,18 +3085,17 @@ app.post("/webhook/email/inbound", upload.any(), async (req, res) => {
     );
 
     // Enqueue reply job (same pattern as SMS)
-    await emailReplyJobs.updateOne(
+  await emailReplyJobs.updateOne(
   { trackingId },
   {
     $setOnInsert: {
       trackingId,
       userId,
-      toEmail: fromEmail,
+      customerEmail: fromEmail,     // ✅ clear name
+      inboundMailbox: toEmail || "",// ✅ which of YOUR inboxes received it
       subject,
       messageId,
       text,
-      // ✅ add this
-      inboundToEmail: toEmail || "",
       status: "queued",
       runAt: new Date(Date.now() + 10_000),
       createdAt: new Date(),
@@ -3117,6 +3103,7 @@ app.post("/webhook/email/inbound", upload.any(), async (req, res) => {
   },
   { upsert: true }
 );
+
 
 
     return res.status(200).json({ ok: true, scheduled: true });
