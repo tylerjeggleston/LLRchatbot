@@ -133,8 +133,6 @@ let emailWebhookEvents;
 let emailReplyJobs;
 
 let emailSenders;
-let emailValidations;
-
 
 async function initDb() {
   await mongo.connect();
@@ -165,7 +163,6 @@ async function initDb() {
   emailReplyJobs = db.collection("Email_ReplyJobs");
 
   emailSenders = db.collection("Email_Senders");
-  emailValidations = db.collection("Email_Validations");
 
   await emailSenders.createIndex({ email: 1 }, { unique: true });
   await emailSenders.createIndex({ enabled: 1 });
@@ -231,13 +228,6 @@ async function initDb() {
   await emailReplyJobs.createIndex({ trackingId: 1 }, { unique: true });
   await emailReplyJobs.createIndex({ status: 1, runAt: 1 });
 
-  await emailValidations.createIndex({ address: 1 }, { unique: true });
-
-  // 2) TTL: auto-expire cache after 30 days
-  await emailValidations.createIndex(
-    { validatedAt: 1 },
-    { expireAfterSeconds: 30 * 24 * 3600 }
-  );
 
 
   console.log("✅ Mongo connected");
@@ -483,78 +473,6 @@ const finalHtml =
     return true;
   }
 }
-
-async function validateEmailViaMailgun(address) {
-  if (!MAILGUN_API_KEY) throw new Error("mailgun_not_configured");
-
-  const url = `${MAILGUN_BASE_URL}/v4/address/validate`;
-
-  const resp = await axios.get(url, {
-    auth: { username: "api", password: MAILGUN_API_KEY }, // basicAuth :contentReference[oaicite:2]{index=2}
-    params: { address, provider_lookup: true },            // query params :contentReference[oaicite:3]{index=3}
-    timeout: 30_000,
-  });
-
-  return resp.data;
-}
-
-function pickValidationDecision(v) {
-  const result = String(v?.result || "").toLowerCase();
-  const risk = String(v?.risk || "").toLowerCase();
-
-  // hard blocks for cold outbound
-  if (v?.is_disposable_address) return { ok: false, action: "reject_disposable" };
-  if (v?.is_role_address) return { ok: false, action: "reject_role" };
-
-  // reputation killers / guaranteed pain
-  if (result === "undeliverable" || result === "do_not_send") return { ok: false, action: "reject" };
-
-  // don't send when risk is high even if "deliverable"
-  if (risk === "high") return { ok: false, action: "skip_high_risk" };
-
-  // safe-ish
-  if (result === "deliverable" && (risk === "low" || risk === "medium")) return { ok: true, action: "send" };
-
-  // catch_all / unknown -> skip by default
-  return { ok: false, action: "skip_risky" };
-}
-
-
-async function getEmailValidationCached(email) {
-  const address = normalizeEmail(email);
-  if (!address) return { ok: false, reason: "invalid_email" };
-
-  // cache hit?
-  const cached = await emailValidations.findOne({ address });
-  if (cached?.payload) {
-    const decision = pickValidationDecision(cached.payload);
-    return { ok: decision.ok, decision, payload: cached.payload, cached: true };
-  }
-
-  // cache miss -> call Mailgun
-  const payload = await validateEmailViaMailgun(address);
-
-  // store
-  await emailValidations.updateOne(
-    { address },
-    {
-      $set: {
-        address,
-        validatedAt: new Date(),
-        payload,
-        result: payload?.result || "",
-        risk: payload?.risk || "",
-        reason: payload?.reason || [],
-      },
-    },
-    { upsert: true }
-  );
-
-  const decision = pickValidationDecision(payload);
-  return { ok: decision.ok, decision, payload, cached: false };
-}
-
-
 
 function startEmailReplyWorker() {
   setInterval(async () => {
@@ -2981,31 +2899,6 @@ app.post("/api/email/batch", async (req, res) => {
         rejects.push({ index: i, email: String(emailRaw), reason: "invalid_email" });
         continue;
       }
-
-      // ✅ Validate deliverability BEFORE enqueue
-      let v;
-      try {
-        v = await getEmailValidationCached(email);
-      } catch (e) {
-        // if validation fails (timeout etc), play it safe and skip
-        rejected++;
-        rejects.push({ index: i, email, reason: "validation_error", detail: e?.message || String(e) });
-        continue;
-      }
-
-      if (!v.ok) {
-        rejected++;
-        rejects.push({
-          index: i,
-          email,
-          reason: `not_sendable:${String(v?.payload?.result || "unknown")}`,
-          risk: String(v?.payload?.risk || ""),
-          why: Array.isArray(v?.payload?.reason) ? v.payload.reason : [],
-          action: v?.decision?.action || "skip",
-        });
-        continue;
-      }
-
 
       const firstName = String(r.firstName || r.firstname || "").trim();
       const lastName = String(r.lastName || r.lastname || "").trim();
