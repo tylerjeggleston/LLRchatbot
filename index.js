@@ -232,6 +232,9 @@ async function initDb() {
   await emailReplyJobs.createIndex({ status: 1, runAt: 1 });
 
   await emailValidations.createIndex({ address: 1 }, { unique: true });
+  await emailQueue.createIndex({ status: 1, sentAt: -1 });
+  await emailQueue.createIndex({ status: 1, failedAt: -1 });
+
 
   // 2) TTL: auto-expire cache after 30 days
   await emailValidations.createIndex(
@@ -2913,6 +2916,44 @@ app.post("/api/email/template", async (req, res) => {
 
   res.json({ ok: true });
 });
+
+// Email overall stats (counts by status + optional last 24h)
+app.get("/api/email/stats", requireAdmin, async (req, res) => {
+  try {
+    // counts by status (queued/processing/sent/failed/etc.)
+    const rows = await emailQueue.aggregate([
+      { $group: { _id: "$status", n: { $sum: 1 } } },
+    ]).toArray();
+
+    const byStatus = {};
+    for (const r of rows) byStatus[String(r._id || "unknown")] = r.n;
+
+    // last 24h sent/failed (optional, but useful)
+    const since = new Date(Date.now() - 24 * 3600 * 1000);
+
+    const [sent24h, failed24h] = await Promise.all([
+      emailQueue.countDocuments({ status: "sent", sentAt: { $gte: since } }),
+      emailQueue.countDocuments({ status: "failed", failedAt: { $gte: since } }),
+    ]);
+
+    res.json({
+      ok: true,
+      byStatus,
+      totals: {
+        sent: byStatus.sent || 0,
+        failed: byStatus.failed || 0,
+        queued: byStatus.queued || 0,
+        processing: byStatus.processing || 0,
+        skipped: byStatus.skipped || 0,
+      },
+      last24h: { sent: sent24h, failed: failed24h },
+    });
+  } catch (e) {
+    console.error("email stats error:", e?.message || e);
+    res.status(500).json({ ok: false, error: "failed_to_load_stats" });
+  }
+});
+
 
 
 app.post("/api/email/batch", async (req, res) => {
