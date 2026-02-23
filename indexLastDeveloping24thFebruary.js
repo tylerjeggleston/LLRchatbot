@@ -79,8 +79,8 @@ async function sendEmailViaMailgun({ from, to, subject, text, html, headers }) {
     }
   }
     // ✅ extra tracing headers
-  //if (headers?.["X-LLR-Sender-Id"]) params.append("h:X-LLR-Sender-Id", String(headers["X-LLR-Sender-Id"]));
-  //if (headers?.["X-LLR-Sender-Email"]) params.append("h:X-LLR-Sender-Email", String(headers["X-LLR-Sender-Email"]));
+  if (headers?.["X-LLR-Sender-Id"]) params.append("h:X-LLR-Sender-Id", String(headers["X-LLR-Sender-Id"]));
+  if (headers?.["X-LLR-Sender-Email"]) params.append("h:X-LLR-Sender-Email", String(headers["X-LLR-Sender-Email"]));
 
 
   const resp = await axios.post(url, params, {
@@ -1030,11 +1030,10 @@ function renderEmail(template, vars) {
     out = out.replaceAll(`{${k}}`, map[k]);
   }
 
-  // ✅ IMPORTANT:
-  // Collapse repeated SPACES/TABS only — NOT newlines.
+  // ✅ Only collapse repeated spaces/tabs (NOT newlines)
   out = out.replace(/[^\S\r\n]{2,}/g, " ");
 
-  // ✅ Remove trailing spaces at end of each line, keep line breaks
+  // Optional: normalize trailing spaces per line
   out = out.replace(/[^\S\r\n]+$/gm, "");
 
   return out.trim();
@@ -1907,11 +1906,6 @@ app.post("/api/conversations/:userId/restore", async (req, res) => {
 app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
   try {
     const { rows, spacingMs, assignedTarget } = req.body;
-    const spacingMsFinal = Math.max(200, Number(spacingMs || OUTBOUND_SPACING_MS));
-
-    // Optional burst pacing (same pattern you used in email/batch)
-    const burstSizeFinal = Math.max(1, Number(req.body?.burstSize || 100));
-    const burstPauseMsFinal = Math.max(0, Number(req.body?.burstPauseMs || 5 * 60_000));
 
     if (!rows.length) return res.status(400).json({ error: "rows_required" });
     if (rows.length > 5000) return res.status(400).json({ error: "too_many_rows" });
@@ -1937,7 +1931,7 @@ app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
       sent: 0,
       failed: 0,
       skipped: 0,
-      spacingMs: spacingMsFinal,
+      spacingMs,
       assignedTarget: assignedTarget || null,
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -1987,15 +1981,8 @@ app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
 
       const message = renderTemplate(settings.template, { firstName, lastName });
 
-      const burstIndex = Math.floor(accepted / burstSizeFinal);
-const offsetInBurst = accepted % burstSizeFinal;
-
-const runAtMs =
-  now +
-  (burstIndex * burstPauseMsFinal) +
-  ((burstIndex * burstSizeFinal + offsetInBurst) * spacingMsFinal);
-
-const runAt = new Date(runAtMs);
+      const burstIndex = burstPauseMsFinal > 0 ? Math.floor(accepted / burstSizeFinal) : 0;
+      const runAt = new Date(now + accepted * spacingMs + burstIndex * burstPauseMsFinal);
 
       const trackingId = `${batchId}:${uid}:${accepted}`;
 
@@ -2034,7 +2021,7 @@ const runAt = new Date(runAtMs);
       accepted,
       rejected,
       rejects: rejects.slice(0, 50),
-      spacingMs: spacingMsFinal,
+      spacingMs,
     });
   } catch (err) {
     console.error("outbound/batch error:", err?.message || err);
@@ -2233,12 +2220,9 @@ if (sess?.optedOut) {
 
     // If all done, close batch (best-effort)
     const b = await outboundBatches.findOne({ _id: batchId });
-    if (b && (b.sent + b.failed + (b.skipped || 0)) >= b.accepted) {
-  await outboundBatches.updateOne(
-    { _id: batchId },
-    { $set: { status: "done", updatedAt: new Date() } }
-  );
-}
+    if (b && b.sent + b.failed >= b.accepted) {
+      await outboundBatches.updateOne({ _id: batchId }, { $set: { status: "done", updatedAt: new Date() } });
+    }
 
     return true;
   } catch (err) {
@@ -2255,12 +2239,9 @@ if (sess?.optedOut) {
     );
 
     const b = await outboundBatches.findOne({ _id: batchId });
-    if (b && (b.sent + b.failed + (b.skipped || 0)) >= b.accepted) {
-  await outboundBatches.updateOne(
-    { _id: batchId },
-    { $set: { status: "done", updatedAt: new Date() } }
-  );
-}
+    if (b && b.sent + b.failed >= b.accepted) {
+      await outboundBatches.updateOne({ _id: batchId }, { $set: { status: "done", updatedAt: new Date() } });
+    }
 
     return true;
   }
