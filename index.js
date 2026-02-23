@@ -232,6 +232,9 @@ async function initDb() {
   await emailReplyJobs.createIndex({ status: 1, runAt: 1 });
 
   await emailValidations.createIndex({ address: 1 }, { unique: true });
+  await emailQueue.createIndex({ status: 1, sentAt: -1 });
+  await emailQueue.createIndex({ status: 1, failedAt: -1 });
+
 
   // 2) TTL: auto-expire cache after 30 days
   await emailValidations.createIndex(
@@ -1978,7 +1981,9 @@ app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
 
       const message = renderTemplate(settings.template, { firstName, lastName });
 
-      const runAt = new Date(now + accepted * spacingMs); // 5s between accepted sends
+      const burstIndex = burstPauseMsFinal > 0 ? Math.floor(accepted / burstSizeFinal) : 0;
+      const runAt = new Date(now + accepted * spacingMs + burstIndex * burstPauseMsFinal);
+
       const trackingId = `${batchId}:${uid}:${accepted}`;
 
       queueDocs.push({
@@ -2914,12 +2919,56 @@ app.post("/api/email/template", async (req, res) => {
   res.json({ ok: true });
 });
 
+// Email overall stats (counts by status + optional last 24h)
+app.get("/api/email/stats", requireAdmin, async (req, res) => {
+  try {
+    // counts by status (queued/processing/sent/failed/etc.)
+    const rows = await emailQueue.aggregate([
+      { $group: { _id: "$status", n: { $sum: 1 } } },
+    ]).toArray();
+
+    const byStatus = {};
+    for (const r of rows) byStatus[String(r._id || "unknown")] = r.n;
+
+    // last 24h sent/failed (optional, but useful)
+    const since = new Date(Date.now() - 24 * 3600 * 1000);
+
+    const [sent24h, failed24h] = await Promise.all([
+      emailQueue.countDocuments({ status: "sent", sentAt: { $gte: since } }),
+      emailQueue.countDocuments({ status: "failed", failedAt: { $gte: since } }),
+    ]);
+
+    res.json({
+      ok: true,
+      byStatus,
+      totals: {
+        sent: byStatus.sent || 0,
+        failed: byStatus.failed || 0,
+        queued: byStatus.queued || 0,
+        processing: byStatus.processing || 0,
+        skipped: byStatus.skipped || 0,
+      },
+      last24h: { sent: sent24h, failed: failed24h },
+    });
+  } catch (e) {
+    console.error("email stats error:", e?.message || e);
+    res.status(500).json({ ok: false, error: "failed_to_load_stats" });
+  }
+});
+
+
 
 app.post("/api/email/batch", async (req, res) => {
   try {
     const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
     const spacingMs = Math.max(200, Number(req.body?.spacingMs || 800));
     const dailyCap = Math.max(1, Number(req.body?.dailyCap || 5000));
+    const burstSize = Math.max(1, Number(req.body?.burstSize || 100));              // 100 per chunk
+    const burstPauseMs = Math.max(0, Number(req.body?.burstPauseMs || 5 * 60_000)); // 5 min pause between chunks
+    const enableBurst = rows.length > 100;
+    const burstSizeFinal = Math.max(1, Number(req.body?.burstSize || 100));          // default: 100
+    const burstPauseMsFinal = Math.max(0, Number(req.body?.burstPauseMs || 5 * 60 * 1000)); // 10 minutes default
+
 
     if (!rows.length) return res.status(400).json({ error: "rows_required" });
     if (rows.length > 20000) return res.status(400).json({ error: "too_many_rows" });
@@ -2961,6 +3010,8 @@ app.post("/api/email/batch", async (req, res) => {
       skipped: 0,
       spacingMs,
       dailyCap,
+      burstSize: burstSizeFinal,
+      burstPauseMs: burstPauseMsFinal,
       senderMode,
       senderId: singleSender ? String(singleSender._id) : null,
       createdAt: new Date(),
@@ -3055,7 +3106,16 @@ const htmlBody =
   `</div>`;
 
 
-      const runAt = new Date(now + accepted * spacingMs);
+  const burstIndex = Math.floor(accepted / burstSizeFinal);          // 0,1,2...
+  const offsetInBurst = accepted % burstSizeFinal;                   // 0..burstSize-1
+
+  const runAtMs =
+  now +
+  (burstIndex * burstPauseMsFinal) +                               // pause after each burst
+  ((burstIndex * burstSizeFinal + offsetInBurst) * spacingMs);     // normal per-email spacing
+
+  const runAt = new Date(runAtMs);
+
       const trackingId = `${batchId}:${email}:${accepted}`;
 
       queueDocs.push({
@@ -3112,6 +3172,8 @@ const htmlBody =
       dailyCap,
       senderMode,
       senderId: singleSender ? String(singleSender._id) : null,
+      burstSize: burstSizeFinal,
+      burstPauseMs: burstPauseMsFinal,
     });
   } catch (e) {
     console.error("email/batch error:", e);
