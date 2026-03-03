@@ -2919,7 +2919,6 @@ app.post("/api/email/template", async (req, res) => {
   res.json({ ok: true });
 });
 
-// Email overall stats (counts by status + optional last 24h)
 app.get("/api/email/stats", requireAdmin, async (req, res) => {
   try {
     // counts by status (queued/processing/sent/failed/etc.)
@@ -2930,13 +2929,36 @@ app.get("/api/email/stats", requireAdmin, async (req, res) => {
     const byStatus = {};
     for (const r of rows) byStatus[String(r._id || "unknown")] = r.n;
 
-    // last 24h sent/failed (optional, but useful)
+    // last 24h sent/failed
     const since = new Date(Date.now() - 24 * 3600 * 1000);
-
     const [sent24h, failed24h] = await Promise.all([
       emailQueue.countDocuments({ status: "sent", sentAt: { $gte: since } }),
       emailQueue.countDocuments({ status: "failed", failedAt: { $gte: since } }),
     ]);
+
+    // ✅ lifetime totals from Email_Batches
+    const batchAgg = await emailBatches.aggregate([
+      {
+        $group: {
+          _id: null,
+          lifetimeTotal: { $sum: { $ifNull: ["$total", 0] } },
+          lifetimeAccepted: { $sum: { $ifNull: ["$accepted", 0] } },
+          lifetimeRejected: { $sum: { $ifNull: ["$rejected", 0] } },
+          lifetimeSent: { $sum: { $ifNull: ["$sent", 0] } },
+          lifetimeFailed: { $sum: { $ifNull: ["$failed", 0] } },
+          lifetimeSkipped: { $sum: { $ifNull: ["$skipped", 0] } },
+        },
+      },
+    ]).toArray();
+
+    const b = batchAgg?.[0] || {
+      lifetimeTotal: 0,
+      lifetimeAccepted: 0,
+      lifetimeRejected: 0,
+      lifetimeSent: 0,
+      lifetimeFailed: 0,
+      lifetimeSkipped: 0,
+    };
 
     res.json({
       ok: true,
@@ -2949,6 +2971,16 @@ app.get("/api/email/stats", requireAdmin, async (req, res) => {
         skipped: byStatus.skipped || 0,
       },
       last24h: { sent: sent24h, failed: failed24h },
+
+      // ✅ NEW: lifetime rollups (from batches)
+      lifetime: {
+        total: b.lifetimeTotal,
+        accepted: b.lifetimeAccepted,
+        rejected: b.lifetimeRejected,
+        sent: b.lifetimeSent,
+        failed: b.lifetimeFailed,
+        skipped: b.lifetimeSkipped,
+      },
     });
   } catch (e) {
     console.error("email stats error:", e?.message || e);
