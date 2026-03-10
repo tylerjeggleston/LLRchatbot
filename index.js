@@ -3215,6 +3215,7 @@ app.post("/api/email/batch", async (req, res) => {
             rejected,
             status: "queued", // ✅ done validating, now queued for worker send
             updatedAt: new Date(),
+            nextSeq: accepted,
           },
           // optional: keep some reject samples on the batch doc (handy for debugging)
           $setOnInsert: {},
@@ -3475,8 +3476,10 @@ app.post("/api/email/batch/append", async (req, res) => {
         const burstIndex = Math.floor(seq / burstSizeFinal);
         const offsetInBurst = seq % burstSizeFinal;
 
+        const base = Number(batch.startAtMs || Date.now());
+
         const runAtMs =
-          Date.now() +
+          base +
           (burstIndex * burstPauseMsFinal) +
           ((burstIndex * burstSizeFinal + offsetInBurst) * spacingMs);
 
