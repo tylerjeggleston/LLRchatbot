@@ -7,6 +7,12 @@ const axios = require("axios");
 const { MongoClient, ObjectId } = require("mongodb");
 const notificationapi = require("notificationapi-node-server-sdk").default;
 
+const nodemailer = require("nodemailer");
+const multer = require("multer");
+const upload = multer();
+
+
+
 const app = express();
 
 app.use(
@@ -40,8 +46,58 @@ const FAQ_DIRECT_THRESHOLD = Number(process.env.FAQ_DIRECT_THRESHOLD || 2.5);
 const OUTBOUND_SPACING_MS = Number(process.env.OUTBOUND_SPACING_MS || 5000); // 5 seconds default
 const OUTBOUND_WORKER_POLL_MS = Number(process.env.OUTBOUND_WORKER_POLL_MS || 1000);
 
+const MAILGUN_API_KEY = process.env.MAILGUN_API_KEY;
+const MAILGUN_DOMAIN = process.env.MAILGUN_DOMAIN;
+const MAILGUN_FROM = process.env.MAILGUN_FROM;
+const MAILGUN_BASE_URL = process.env.MAILGUN_BASE_URL || "https://api.mailgun.net";
+
+
+
+async function sendEmailViaMailgun({ from, to, subject, text, html, headers }) {
+  if (!MAILGUN_API_KEY || !MAILGUN_DOMAIN) {
+    throw new Error("mailgun_not_configured");
+  }
+
+  const url = `${MAILGUN_BASE_URL}/v3/${MAILGUN_DOMAIN}/messages`;
+
+  const params = new URLSearchParams();
+
+  // ✅ allow per-message FROM (falls back to env)
+  const fromFinal = String(from || MAILGUN_FROM || "").trim();
+  if (!fromFinal) throw new Error("mailgun_from_missing");
+
+  params.append("from", fromFinal);
+  params.append("to", to);
+  params.append("subject", subject || "");
+  if (text) params.append("text", text);
+  if (html) params.append("html", html);
+
+  // Custom headers (Mailgun uses h:Header-Name)
+  if (headers && typeof headers === "object") {
+    for (const [k, v] of Object.entries(headers)) {
+      if (v) params.append(`h:${k}`, String(v));
+    }
+  }
+    // ✅ extra tracing headers
+  if (headers?.["X-LLR-Sender-Id"]) params.append("h:X-LLR-Sender-Id", String(headers["X-LLR-Sender-Id"]));
+  if (headers?.["X-LLR-Sender-Email"]) params.append("h:X-LLR-Sender-Email", String(headers["X-LLR-Sender-Email"]));
+
+
+  const resp = await axios.post(url, params, {
+    auth: { username: "api", password: MAILGUN_API_KEY },
+    timeout: 60000,
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+  });
+
+  return resp.data;
+}
+
+
+
 if (!NOTIF_CLIENT_ID || !NOTIF_CLIENT_SECRET) throw new Error("Missing NOTIF_CLIENT_ID / NOTIF_CLIENT_SECRET");
 if (!NOTIF_INBOUND_WEBHOOK_SECRET) throw new Error("Missing NOTIF_INBOUND_WEBHOOK_SECRET");
+if (!process.env.EMAIL_INBOUND_WEBHOOK_SECRET) throw new Error("Missing EMAIL_INBOUND_WEBHOOK_SECRET");
+
 if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
 if (!MONGODB_URI) throw new Error("Missing MONGODB_URI");
 
@@ -67,6 +123,19 @@ let outboundSettings;
 let outboundBatches;
 let outboundQueue;
 
+// Email blast:
+let emailSettings;
+let emailBatches;
+let emailQueue;
+
+let emailSessions;
+let emailWebhookEvents;
+let emailReplyJobs;
+
+let emailSenders;
+let emailValidations;
+
+
 async function initDb() {
   await mongo.connect();
   const db = mongo.db(MONGODB_DB);
@@ -86,6 +155,20 @@ async function initDb() {
   outboundSettings = db.collection("Outbound_Settings");
   outboundBatches = db.collection("Outbound_Batches");
   outboundQueue = db.collection("Outbound_Queue");
+
+  emailSettings = db.collection("Email_Settings");
+  emailBatches = db.collection("Email_Batches");
+  emailQueue = db.collection("Email_Queue");
+
+  emailSessions = db.collection("Email_Sessions");
+  emailWebhookEvents = db.collection("Email_Webhook_Events");
+  emailReplyJobs = db.collection("Email_ReplyJobs");
+
+  emailSenders = db.collection("Email_Senders");
+  emailValidations = db.collection("Email_Validations");
+
+  await emailSenders.createIndex({ email: 1 }, { unique: true });
+  await emailSenders.createIndex({ enabled: 1 });
 
   // sessions
   await sessions.createIndex({ userId: 1 }, { unique: true });
@@ -132,6 +215,33 @@ async function initDb() {
   await dncEvents.createIndex({ userId: 1, createdAt: -1 });
   await sessions.createIndex({ hidden: 1, updatedAt: -1, userId: 1 });
 
+  await emailSettings.createIndex({ key: 1 }, { unique: true });
+  await emailBatches.createIndex({ createdAt: -1 });
+  await emailQueue.createIndex({ batchId: 1, runAt: 1 });
+  await emailQueue.createIndex({ status: 1, runAt: 1 });
+  await emailQueue.createIndex({ trackingId: 1 }, { unique: true });
+
+  await emailSessions.createIndex({ userId: 1 }, { unique: true });
+  await emailSessions.createIndex({ email: 1 });
+  await emailSessions.createIndex({ updatedAt: -1 });
+
+  await emailWebhookEvents.createIndex({ trackingId: 1 }, { unique: true });
+  await emailWebhookEvents.createIndex({ createdAt: 1 }, { expireAfterSeconds: 7 * 24 * 3600 });
+
+  await emailReplyJobs.createIndex({ trackingId: 1 }, { unique: true });
+  await emailReplyJobs.createIndex({ status: 1, runAt: 1 });
+
+  await emailValidations.createIndex({ address: 1 }, { unique: true });
+  await emailQueue.createIndex({ status: 1, sentAt: -1 });
+  await emailQueue.createIndex({ status: 1, failedAt: -1 });
+
+
+  // 2) TTL: auto-expire cache after 30 days
+  await emailValidations.createIndex(
+    { validatedAt: 1 },
+    { expireAfterSeconds: 30 * 24 * 3600 }
+  );
+
 
   console.log("✅ Mongo connected");
 
@@ -168,6 +278,300 @@ async function initDb() {
 }
 
 // ----------------- Helpers -----------------
+
+function escapeHtml(s) {
+  return String(s || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function escapeHtmlToParagraphs(text) {
+  const lines = String(text || "").split(/\r?\n/);
+  let html = "";
+  let buf = [];
+
+  for (const line of lines) {
+    if (line.trim() === "") {
+      if (buf.length) {
+        html += `<p style="margin:0 0 12px 0;">${escapeHtml(buf.join(" "))}</p>`;
+        buf = [];
+      }
+      continue;
+    }
+    buf.push(line.trim());
+  }
+
+  if (buf.length) html += `<p style="margin:0 0 12px 0;">${escapeHtml(buf.join(" "))}</p>`;
+  return html || "";
+}
+
+
+async function verifySmtp() {
+  if (!smtpTransport) {
+    console.log("❌ SMTP not configured");
+    return;
+  }
+  try {
+    await smtpTransport.verify();
+    console.log("✅ SMTP verified");
+  } catch (e) {
+    console.log("❌ SMTP verify failed:", e?.message || e);
+  }
+}
+
+
+async function openaiEmailReply({ userText, history, faqContext = "" }) {
+  const goalCfg = await getOverallGoal();
+  const overallGoalText = goalCfg.enabled && goalCfg.goal ? goalCfg.goal : "(none)";
+
+  const system = `
+You are an AI email assistant for a business. Be clear, concise, and helpful.
+
+OVERALL GOAL:
+${overallGoalText}
+
+FAQ KB (source of truth when relevant):
+${faqContext || "(none)"}
+
+Rules:
+- Keep it under 120 words unless truly necessary.
+- No markdown.
+- Be direct and professional (not stiff).
+- Ask at most 1 question back.
+- If unsure, say what you need.
+- Don't mention internal systems, webhooks, APIs.
+- Always respond in the same language as the user.
+`.trim();
+
+  const messages = [
+    { role: "system", content: system },
+    ...(Array.isArray(history) ? history.slice(-10).map(m => ({
+      role: m.role === "agent" ? "assistant" : m.role === "customer" ? "user" : (m.role || "user"),
+      content: String(m.content || "")
+    })) : []),
+    { role: "user", content: userText },
+  ];
+
+  const resp = await axios.post(
+    "https://api.openai.com/v1/chat/completions",
+    { model: OPENAI_MODEL, messages, temperature: 0.3, max_tokens: 220 },
+    { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }, timeout: 60000 }
+  );
+
+  return resp.data?.choices?.[0]?.message?.content?.trim() || "";
+}
+
+async function processOneEmailReplyJob() {
+  const now = new Date();
+
+  const claimed = await emailReplyJobs.findOneAndUpdate(
+    { status: "queued", runAt: { $lte: now } },
+    { $set: { status: "processing", processingAt: now } },
+    { sort: { runAt: 1 }, returnDocument: "after" }
+  );
+
+  const job = claimed?.value ?? claimed ?? null;
+  if (!job?._id) return false;
+
+  try {
+    const sess = await emailSessions.findOne({ userId: job.userId });
+    const history = sess?.history || [];
+
+    const faqHits = await fetchRelevantFaqs(job.text, 5);
+    const topFaq = faqHits[0];
+
+    let replyText = "";
+    if (topFaq && typeof topFaq.score === "number" && topFaq.score >= FAQ_DIRECT_THRESHOLD) {
+      replyText = String(topFaq.answer || "").trim();
+    } else {
+      const faqContext = buildFaqContext(faqHits);
+      replyText = await openaiEmailReply({ userText: job.text, history, faqContext });
+    }
+
+    replyText = String(replyText || "").trim();
+    if (!replyText) {
+      await emailReplyJobs.updateOne({ _id: job._id }, { $set: { status: "done", doneAt: new Date(), note: "empty_reply" } });
+      return true;
+    }
+
+    // Add signature (keep stable)
+    // ✅ 1) load template (fallback sigs)
+const tpl = await getEmailBlastTemplate();
+
+// ✅ 2) choose sender that received the inbound
+let sender = null;
+
+// Prefer inboundToEmail (most reliable)
+if (job.inboundToEmail) {
+  sender = await emailSenders.findOne({ email: normalizeEmail(job.inboundToEmail) });
+}
+
+// If not found, fallback: try to decode from message headers you injected
+// (Sometimes providers include your custom header in inbound payload; not always)
+if (!sender && job.senderId && ObjectId.isValid(job.senderId)) {
+  sender = await emailSenders.findOne({ _id: new ObjectId(job.senderId) });
+}
+
+// If still not found, final fallback: first enabled sender (don’t block replies)
+if (!sender) {
+  sender = await emailSenders.findOne({ enabled: true }, { sort: { createdAt: 1 } });
+}
+
+const fromEmail = String(sender?.email || "").trim();
+const fromName = String(sender?.name || "").trim();
+const from = fromName ? `${fromName} <${fromEmail}>` : fromEmail;
+
+const replyTo = String(sender?.replyTo || "").trim();
+
+// ✅ 3) signature: sender override, else template fallback
+const sigTextFinal = String(sender?.signatureText || sender?.signature || tpl.signatureText || "").trim();
+const sigHtmlFinal = String(sender?.signatureHtml || tpl.signatureHtml || "").trim();
+
+
+// ✅ 4) final bodies
+const finalText =
+  [replyText, sigTextFinal].filter(Boolean).join("\n\n").trim();
+
+const sigHtmlFallback = sigHtmlFinal || textSigToHtml(sigTextFinal);
+
+const finalHtml =
+  `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.45;color:#111;">` +
+  `${escapeHtmlToParagraphs(replyText)}` +
+  `${sigHtmlFallback ? `<div style="margin-top:16px;">${sigHtmlFallback}</div>` : ""}` +
+  `</div>`;
+
+
+    // ✅ 5) send via Mailgun using SAME sender
+    await sendEmailViaMailgun({
+    from,
+    to: job.toEmail,
+    subject: job.subject?.toLowerCase().startsWith("re:") ? job.subject : `Re: ${job.subject || "Quick question"}`,
+    text: finalText,
+    html: finalHtml,
+    headers: {
+        ...(replyTo ? { "Reply-To": replyTo } : {}),
+        ...(job.messageId ? { "In-Reply-To": job.messageId, "References": job.messageId } : {}),
+        "X-LLR-Sender-Id": String(sender?._id || ""),
+        "X-LLR-Sender-Email": fromEmail,
+    },
+    });
+
+    // ✅ Save outbound in session (store the actual body you sent)
+    await emailSessions.updateOne(
+  { userId: job.userId },
+  {
+    $set: { updatedAt: new Date() },
+    $push: {
+      history: {
+        $each: [{ role: "assistant", content: finalText, createdAt: new Date() }],
+        $slice: -50
+      }
+    }
+  }
+);
+
+
+    await emailReplyJobs.updateOne({ _id: job._id }, { $set: { status: "done", doneAt: new Date() } });
+    return true;
+
+  } catch (e) {
+    console.error("email reply job error:", e?.message || e);
+    await emailReplyJobs.updateOne(
+      { _id: job._id },
+      { $set: { status: "failed", failedAt: new Date(), error: String(e?.message || e) } }
+    );
+    return true;
+  }
+}
+
+async function validateEmailViaMailgun(address) {
+  if (!MAILGUN_API_KEY) throw new Error("mailgun_not_configured");
+
+  const url = `${MAILGUN_BASE_URL}/v4/address/validate`;
+
+  const resp = await axios.get(url, {
+    auth: { username: "api", password: MAILGUN_API_KEY }, // basicAuth :contentReference[oaicite:2]{index=2}
+    params: { address, provider_lookup: true },            // query params :contentReference[oaicite:3]{index=3}
+    timeout: 30_000,
+  });
+
+  return resp.data;
+}
+
+function pickValidationDecision(v) {
+  const result = String(v?.result || "").toLowerCase();
+  const risk = String(v?.risk || "").toLowerCase();
+
+  // hard blocks for cold outbound
+  if (v?.is_disposable_address) return { ok: false, action: "reject_disposable" };
+  if (v?.is_role_address) return { ok: false, action: "reject_role" };
+
+  // reputation killers / guaranteed pain
+  if (result === "undeliverable" || result === "do_not_send") return { ok: false, action: "reject" };
+
+  // don't send when risk is high even if "deliverable"
+  if (risk === "high") return { ok: false, action: "skip_high_risk" };
+
+  // safe-ish
+  if (result === "deliverable" && (risk === "low" || risk === "medium")) return { ok: true, action: "send" };
+
+  // catch_all / unknown -> skip by default
+  return { ok: false, action: "skip_risky" };
+}
+
+
+async function getEmailValidationCached(email) {
+  const address = normalizeEmail(email);
+  if (!address) return { ok: false, reason: "invalid_email" };
+
+  // cache hit?
+  const cached = await emailValidations.findOne({ address });
+  if (cached?.payload) {
+    const decision = pickValidationDecision(cached.payload);
+    return { ok: decision.ok, decision, payload: cached.payload, cached: true };
+  }
+
+  // cache miss -> call Mailgun
+  const payload = await validateEmailViaMailgun(address);
+
+  // store
+  await emailValidations.updateOne(
+    { address },
+    {
+      $set: {
+        address,
+        validatedAt: new Date(),
+        payload,
+        result: payload?.result || "",
+        risk: payload?.risk || "",
+        reason: payload?.reason || [],
+      },
+    },
+    { upsert: true }
+  );
+
+  const decision = pickValidationDecision(payload);
+  return { ok: decision.ok, decision, payload, cached: false };
+}
+
+
+
+function startEmailReplyWorker() {
+  setInterval(async () => {
+    try {
+      await processOneEmailReplyJob();
+    } catch (e) {
+      console.error("Email reply worker tick error:", e?.message || e);
+    }
+  }, 1500);
+
+  console.log("✅ Email reply worker started");
+}
+
+
 function requireAdmin(req, res, next) {
   if (!ADMIN_API_KEY) return next(); // public if unset (your preference right now)
   const key = req.header("x-admin-key");
@@ -226,6 +630,152 @@ function isLowValueClosingMessage(text = "") {
 
   return patterns.some((p) => t === p);
 }
+
+function normalizeEmailUserId(email) {
+  return String(email || "").trim().toLowerCase();
+}
+
+
+
+function safeJsonParse(s) {
+  try { return JSON.parse(s); } catch { return null; }
+}
+
+function extractFromEmail(payload) {
+  // Common direct fields
+  const direct =
+    payload.from ||
+    payload.sender ||
+    payload.From ||
+    payload["from_email"] ||
+    payload["sender_email"] ||
+    payload["from-address"];
+
+  // SendGrid often provides "from" like: 'John Doe <john@example.com>'
+  // Mailgun can provide "from" like that too.
+  if (direct) {
+    const m = String(direct).match(/<([^>]+)>/);
+    const raw = m ? m[1] : direct;
+    return normalizeEmail(raw);
+  }
+
+  // SendGrid inbound parse: envelope is JSON string containing from/to
+  // envelope: {"to":["x@domain.com"],"from":"john@example.com",...}
+  if (payload.envelope) {
+    const env = typeof payload.envelope === "string" ? safeJsonParse(payload.envelope) : payload.envelope;
+    if (env?.from) return normalizeEmail(env.from);
+  }
+
+  // Postmark sometimes uses FromFull: { Email, Name }
+  if (payload.FromFull?.Email) return normalizeEmail(payload.FromFull.Email);
+
+  // SES often includes mail.source or commonHeaders.from
+  if (payload.mail?.source) return normalizeEmail(payload.mail.source);
+  const fromArr = payload.mail?.commonHeaders?.from;
+  if (Array.isArray(fromArr) && fromArr[0]) {
+    const m = String(fromArr[0]).match(/<([^>]+)>/);
+    return normalizeEmail(m ? m[1] : fromArr[0]);
+  }
+
+  return null;
+}
+
+function extractToEmail(payload) {
+  const direct =
+    payload.recipient ||
+    payload.to ||
+    payload.To ||
+    payload["to"] ||
+    payload["to_email"] ||
+    payload["recipient-email"] ||
+    payload["Delivered-To"];
+
+  if (direct) {
+    const m = String(direct).match(/<([^>]+)>/);
+    const raw = m ? m[1] : direct;
+    return normalizeEmail(raw);
+  }
+
+  // Mailgun commonly gives "recipient"
+  if (payload.envelope) {
+    const env = typeof payload.envelope === "string" ? safeJsonParse(payload.envelope) : payload.envelope;
+    const to = Array.isArray(env?.to) ? env.to[0] : env?.to;
+    if (to) return normalizeEmail(to);
+  }
+
+  return null;
+}
+
+
+function extractEmailText(payload) {
+  // Try common plain-text fields first
+  const candidates = [
+    payload["stripped-text"],        // Mailgun best
+    payload["body-plain"],           // Mailgun
+    payload.text,                    // SendGrid inbound parse
+    payload.TextBody,                // Postmark
+    payload.textBody,
+    payload.plain,
+    payload["body"],                 // sometimes
+  ];
+
+  for (const c of candidates) {
+    const t = String(c || "").trim();
+    if (t) return t;
+  }
+
+  // HTML fallback (strip tags)
+  const html = String(
+    payload["stripped-html"] ||
+    payload["body-html"] ||
+    payload.html ||
+    payload.HtmlBody ||
+    ""
+  ).trim();
+
+  if (html) {
+    return html
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  return "";
+}
+
+
+function extractMessageId(payload) {
+  // Many providers include one of these:
+  return String(
+    payload["message-id"] ||
+    payload["Message-Id"] ||
+    payload.messageId ||
+    payload.MessageID ||
+    payload["MessageID"] ||
+    ""
+  ).trim();
+}
+
+function textSigToHtml(sigText) {
+  const t = String(sigText || "").trim();
+  if (!t) return "";
+  // preserve line breaks nicely
+  return `<div style="white-space:pre-line;">${escapeHtml(t)}</div>`;
+}
+
+
+
+function shouldIgnoreEmail(payload) {
+  const subject = String(payload.subject || "").toLowerCase();
+  // avoid loops: auto-replies, bounces, etc.
+  const auto = String(payload["auto-submitted"] || "").toLowerCase();
+  if (auto.includes("auto-replied") || auto.includes("auto-generated")) return true;
+  if (subject.includes("undeliver") || subject.includes("delivery status")) return true;
+  return false;
+}
+
 
 
 function lastAssistantWasClosing(history = []) {
@@ -455,6 +1005,185 @@ async function getOverallGoal() {
 //   );
 
 // }
+
+
+
+
+  function normalizeEmail(input) {
+  const e = String(input || "").trim().toLowerCase();
+  if (!e) return null;
+  // simple sanity check (good enough for 99% lists)
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) return null;
+  return e;
+}
+
+function renderEmail(template, vars) {
+  let out = String(template || "");
+  const firstName = String(vars.firstName || "").trim();
+  const lastName = String(vars.lastName || "").trim();
+  const fullName = `${firstName} ${lastName}`.trim();
+
+  const map = { firstName, lastName, fullName };
+
+  for (const k of Object.keys(map)) {
+    out = out.replaceAll(`{{${k}}}`, map[k]);
+    out = out.replaceAll(`{${k}}`, map[k]);
+  }
+
+  // ✅ Only collapse repeated spaces/tabs (NOT newlines)
+  out = out.replace(/[^\S\r\n]{2,}/g, " ");
+
+  // Optional: normalize trailing spaces per line
+  out = out.replace(/[^\S\r\n]+$/gm, "");
+
+  return out.trim();
+}
+
+
+async function getEmailBlastTemplate() {
+  const defaults = {
+    key: "email_blast_template",
+    subject: "Quick question, {{firstName}}",
+    body: "Hey {{firstName}},\n\nAre you free for a quick chat?\n",
+    signatureText: "",          // <-- default blank
+    signatureHtml: "",          // <-- default blank
+    flyerImageUrl: "",
+    enabled: true,
+  };
+
+  const doc = await emailSettings.findOne({ key: "email_blast_template" });
+  const merged = { ...defaults, ...(doc || {}) };
+
+  // only backfill subject/body/flyer if blank
+  for (const k of ["subject", "body", "flyerImageUrl"]) {
+    if (typeof merged[k] === "string" && merged[k].trim() === "") {
+      merged[k] = defaults[k];
+    }
+  }
+
+  // DO NOT backfill signature fields — blank should mean “no template signature”
+  if (typeof merged.enabled !== "boolean") merged.enabled = true;
+
+  return merged;
+}
+
+
+
+const SMTP_HOST = process.env.SMTP_HOST;
+const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
+const SMTP_USER = process.env.SMTP_USER;
+const SMTP_PASS = process.env.SMTP_PASS;
+const EMAIL_FROM = process.env.EMAIL_FROM || SMTP_USER;
+
+const smtpTransport =
+  SMTP_HOST && SMTP_USER && SMTP_PASS
+    ? nodemailer.createTransport({
+        host: SMTP_HOST,
+        port: SMTP_PORT,
+        secure: SMTP_PORT === 465,
+        auth: { user: SMTP_USER, pass: SMTP_PASS },
+      })
+    : null;
+
+async function sendEmailViaSMTP({ to, subject, text, html }) {
+  if (!smtpTransport) throw new Error("smtp_not_configured");
+  await smtpTransport.sendMail({
+    from: EMAIL_FROM,
+    to,
+    subject,
+    text,
+    html,
+  });
+}
+
+
+async function processOneEmailJob() {
+  const now = new Date();
+
+  const claimed = await emailQueue.findOneAndUpdate(
+    { status: "queued", runAt: { $lte: now } },
+    { $set: { status: "processing", processingAt: now } },
+    { sort: { runAt: 1 }, returnDocument: "after" }
+  );
+
+  const job = claimed?.value ?? claimed ?? null;
+  if (!job || !job._id) return false;
+
+  try {
+    // choose ONE sender (pick your path)
+    // await sendEmailViaSendGrid({ to: job.email, subject: job.subject, text: job.body });
+    // await sendEmailViaSMTP({ to: job.email, subject: job.subject, text: job.body });
+await sendEmailViaMailgun({
+  from: job.from,
+  to: job.email,
+  subject: job.subject,
+  text: job.textBody || job.body,
+  html: job.htmlBody || undefined,
+  headers: {
+    ...(job.replyTo ? { "Reply-To": job.replyTo } : {}),
+    "X-LLR-Sender-Id": job.senderId || "",
+    "X-LLR-Sender-Email": (String(job.from || "").match(/<([^>]+)>/)?.[1] || job.from || ""),
+  },
+});
+
+
+
+
+    await emailQueue.updateOne(
+      { _id: job._id },
+      { $set: { status: "sent", sentAt: new Date() } }
+    );
+
+    await emailBatches.updateOne(
+      { _id: job.batchId },
+      { $inc: { sent: 1 }, $set: { updatedAt: new Date() } }
+    );
+
+    return true;
+  } catch (e) {
+  const status = e?.response?.status;
+  const data = e?.response?.data;
+  const detail =
+    data ? JSON.stringify(data) :
+    (e?.message || String(e));
+
+  console.error("❌ Mailgun send failed:", { status, detail });
+
+  await emailQueue.updateOne(
+    { _id: job._id },
+    {
+      $set: {
+        status: "failed",
+        failedAt: new Date(),
+        error: detail,
+        errorStatus: status || null,
+      }
+    }
+  );
+
+  await emailBatches.updateOne(
+    { _id: job.batchId },
+    { $inc: { failed: 1 }, $set: { updatedAt: new Date() } }
+  );
+
+  return true;
+}
+
+}
+
+function startEmailWorker() {
+  setInterval(async () => {
+    try {
+      await processOneEmailJob();
+    } catch (e) {
+      console.error("Email worker tick error:", e?.message || e);
+    }
+  }, 500);
+
+  console.log("✅ Email worker started");
+}
+
+
 
 async function sendEscalationAlerts({ userId, from, text, matchedKeywords, inboundFirstName, inboundLastName }) {
   const cfg = await getEscalationConfig();
@@ -1252,7 +1981,9 @@ app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
 
       const message = renderTemplate(settings.template, { firstName, lastName });
 
-      const runAt = new Date(now + accepted * spacingMs); // 5s between accepted sends
+      const burstIndex = burstPauseMsFinal > 0 ? Math.floor(accepted / burstSizeFinal) : 0;
+      const runAt = new Date(now + accepted * spacingMs + burstIndex * burstPauseMsFinal);
+
       const trackingId = `${batchId}:${uid}:${accepted}`;
 
       queueDocs.push({
@@ -2142,14 +2873,584 @@ app.delete("/api/faq/:id", requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
+
+app.get("/api/email/template", async (req, res) => {
+  const doc = await getEmailBlastTemplate();
+  res.json({
+    subject: doc.subject || "",
+    body: doc.body || "",
+    signatureText: doc.signatureText || "",
+    signatureHtml: doc.signatureHtml || "",
+    flyerImageUrl: doc.flyerImageUrl || "",
+    enabled: !!doc.enabled,
+  });
+});
+
+
+
+app.post("/api/email/template", async (req, res) => {
+  const subject = String(req.body?.subject || "").trim();
+  const body = String(req.body?.body || "").trim();
+  const signatureText = String(req.body?.signatureText || "").trim();
+  const signatureHtml = String(req.body?.signatureHtml || "").trim();
+  const flyerImageUrl = String(req.body?.flyerImageUrl || "").trim();
+  const enabled = req.body?.enabled;
+
+  if (!subject) return res.status(400).json({ error: "subject_required" });
+  if (!body) return res.status(400).json({ error: "body_required" });
+
+  await emailSettings.updateOne(
+    { key: "email_blast_template" },
+    {
+      $set: {
+        subject,
+        body,
+        signatureText,
+        signatureHtml,
+        flyerImageUrl,
+        enabled: typeof enabled === "boolean" ? enabled : true,
+        updatedAt: new Date(),
+      },
+      $setOnInsert: { key: "email_blast_template", createdAt: new Date() },
+    },
+    { upsert: true }
+  );
+
+  res.json({ ok: true });
+});
+
+app.get("/api/email/stats", requireAdmin, async (req, res) => {
+  try {
+    // counts by status (queued/processing/sent/failed/etc.)
+    const rows = await emailQueue.aggregate([
+      { $group: { _id: "$status", n: { $sum: 1 } } },
+    ]).toArray();
+
+    const byStatus = {};
+    for (const r of rows) byStatus[String(r._id || "unknown")] = r.n;
+
+    // last 24h sent/failed
+    const since = new Date(Date.now() - 24 * 3600 * 1000);
+    const [sent24h, failed24h] = await Promise.all([
+      emailQueue.countDocuments({ status: "sent", sentAt: { $gte: since } }),
+      emailQueue.countDocuments({ status: "failed", failedAt: { $gte: since } }),
+    ]);
+
+    // ✅ lifetime totals from Email_Batches
+    const batchAgg = await emailBatches.aggregate([
+      {
+        $group: {
+          _id: null,
+          lifetimeTotal: { $sum: { $ifNull: ["$total", 0] } },
+          lifetimeAccepted: { $sum: { $ifNull: ["$accepted", 0] } },
+          lifetimeRejected: { $sum: { $ifNull: ["$rejected", 0] } },
+          lifetimeSent: { $sum: { $ifNull: ["$sent", 0] } },
+          lifetimeFailed: { $sum: { $ifNull: ["$failed", 0] } },
+          lifetimeSkipped: { $sum: { $ifNull: ["$skipped", 0] } },
+        },
+      },
+    ]).toArray();
+
+    const b = batchAgg?.[0] || {
+      lifetimeTotal: 0,
+      lifetimeAccepted: 0,
+      lifetimeRejected: 0,
+      lifetimeSent: 0,
+      lifetimeFailed: 0,
+      lifetimeSkipped: 0,
+    };
+
+    res.json({
+      ok: true,
+      byStatus,
+      totals: {
+        sent: byStatus.sent || 0,
+        failed: byStatus.failed || 0,
+        queued: byStatus.queued || 0,
+        processing: byStatus.processing || 0,
+        skipped: byStatus.skipped || 0,
+      },
+      last24h: { sent: sent24h, failed: failed24h },
+
+      // ✅ NEW: lifetime rollups (from batches)
+      lifetime: {
+        total: b.lifetimeTotal,
+        accepted: b.lifetimeAccepted,
+        rejected: b.lifetimeRejected,
+        sent: b.lifetimeSent,
+        failed: b.lifetimeFailed,
+        skipped: b.lifetimeSkipped,
+      },
+    });
+  } catch (e) {
+    console.error("email stats error:", e?.message || e);
+    res.status(500).json({ ok: false, error: "failed_to_load_stats" });
+  }
+});
+
+
+
+app.post("/api/email/batch", async (req, res) => {
+  try {
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    const spacingMs = Math.max(200, Number(req.body?.spacingMs || 800));
+    const dailyCap = Math.max(1, Number(req.body?.dailyCap || 5000));
+    const burstSizeFinal = Math.max(1, Number(req.body?.burstSize || 100));
+    const burstPauseMsFinal = Math.max(0, Number(req.body?.burstPauseMs || 5 * 60 * 1000)); // 10 min default
+
+    if (!rows.length) return res.status(400).json({ error: "rows_required" });
+    if (rows.length > 20000) return res.status(400).json({ error: "too_many_rows" });
+
+    const tpl = await getEmailBlastTemplate();
+    if (!tpl.enabled) return res.status(409).json({ error: "email_template_disabled" });
+
+    // ✅ fetch enabled senders ONCE
+    const enabledSenders = await emailSenders
+      .find({ enabled: true })
+      .sort({ createdAt: 1 })
+      .toArray();
+
+    if (!enabledSenders.length) return res.status(409).json({ error: "no_enabled_senders" });
+
+    const senderMode = String(req.body?.senderMode || "auto"); // "auto" | "single"
+    const senderIdRaw = String(req.body?.senderId || "").trim();
+
+    let singleSender = null;
+    if (senderMode === "single") {
+      if (!ObjectId.isValid(senderIdRaw)) return res.status(400).json({ error: "invalid_senderId" });
+      singleSender = enabledSenders.find((s) => String(s._id) === senderIdRaw) || null;
+      if (!singleSender) return res.status(409).json({ error: "sender_not_found_or_disabled" });
+    }
+
+    const batchId = new ObjectId().toString();
+    const now = Date.now();
+
+    // ✅ Create batch immediately with "validating" state
+    await emailBatches.insertOne({
+      _id: batchId,
+      status: "validating", // ✅ NEW
+      total: rows.length,
+      accepted: 0,
+      rejected: 0,
+      sent: 0,
+      failed: 0,
+      skipped: 0,
+      spacingMs,
+      dailyCap,
+      burstSize: burstSizeFinal,
+      burstPauseMs: burstPauseMsFinal,
+      senderMode,
+      senderId: singleSender ? String(singleSender._id) : null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    // ✅ Respond immediately so frontend never "Failed to fetch"
+    // Frontend already polls /api/email/batch/:batchId, so it will update.
+    res.status(202).json({
+      ok: true,
+      batchId,
+      total: rows.length,
+      accepted: 0,
+      rejected: 0,
+      status: "validating",
+      spacingMs,
+      dailyCap,
+      senderMode,
+      senderId: singleSender ? String(singleSender._id) : null,
+      burstSize: burstSizeFinal,
+      burstPauseMs: burstPauseMsFinal,
+    });
+
+    // ------------------------------------------------------------
+    // Background validation + enqueue (keeps your old perfect filtering)
+    // ------------------------------------------------------------
+    (async () => {
+      let accepted = 0;
+      let rejected = 0;
+      const rejects = [];
+      const queueDocs = [];
+
+      // simple concurrency limiter (no new deps)
+      const CONCURRENCY = 8; // tune: 4-12 is usually fine
+      let idx = 0;
+
+      async function handleRow(i) {
+        const r = rows[i] || {};
+        const emailRaw = r.email || r.Email || "";
+        const email = normalizeEmail(emailRaw);
+
+        if (!email) {
+          rejected++;
+          rejects.push({ index: i, email: String(emailRaw), reason: "invalid_email" });
+          return;
+        }
+
+        // stop if daily cap hit
+        if (accepted >= dailyCap) return;
+
+        // ✅ Mailgun deliverability validation BEFORE enqueue (same as your old behavior)
+        let v;
+        try {
+          v = await getEmailValidationCached(email);
+        } catch (e) {
+          rejected++;
+          rejects.push({
+            index: i,
+            email,
+            reason: "validation_error",
+            detail: e?.message || String(e),
+          });
+          return;
+        }
+
+        if (!v?.ok) {
+          rejected++;
+          rejects.push({
+            index: i,
+            email,
+            reason: `not_sendable:${String(v?.payload?.result || "unknown")}`,
+            risk: String(v?.payload?.risk || ""),
+            why: Array.isArray(v?.payload?.reason) ? v.payload.reason : [],
+            action: v?.decision?.action || "skip",
+          });
+          return;
+        }
+
+        const firstName = String(r.firstName || r.firstname || "").trim();
+        const lastName = String(r.lastName || r.lastname || "").trim();
+
+        const subject = renderEmail(tpl.subject, { firstName, lastName });
+        const mainText = renderEmail(tpl.body, { firstName, lastName });
+
+        const safeFlyerUrl = String(tpl.flyerImageUrl || "").trim();
+        const flyerHtml = safeFlyerUrl
+          ? `<div style="margin-top:12px;"><img src="${safeFlyerUrl}" alt="Leads Locker Room" style="max-width:600px;width:100%;height:auto;border:0;" /></div>`
+          : "";
+
+        // ✅ pick sender
+        const sender = singleSender || enabledSenders[accepted % enabledSenders.length];
+
+        const fromEmail = String(sender.email || "").trim();
+        const fromName = String(sender.name || "").trim();
+        const from = fromName ? `${fromName} <${fromEmail}>` : fromEmail;
+
+        const replyTo = String(sender.replyTo || "").trim();
+
+        // ✅ sender signature overrides template signature
+        const sigTextFinal = renderEmail(
+          (sender.signatureText || sender.signature || tpl.signatureText || ""),
+          { firstName, lastName }
+        );
+
+        const sigHtmlFinal = renderEmail(
+          (sender.signatureHtml || tpl.signatureHtml || ""),
+          { firstName, lastName }
+        );
+
+        const sigHtmlFallback = sigHtmlFinal || textSigToHtml(sigTextFinal);
+
+        const textBody = [mainText, sigTextFinal].filter(Boolean).join("\n\n").trim();
+
+        const htmlBody =
+          `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.45;color:#111;">` +
+          `${escapeHtmlToParagraphs(mainText)}` +
+          `${sigHtmlFallback ? `<div style="margin-top:16px;">${sigHtmlFallback}</div>` : ""}` +
+          `${flyerHtml}` +
+          `</div>`;
+
+        const burstIndex = Math.floor(accepted / burstSizeFinal);
+        const offsetInBurst = accepted % burstSizeFinal;
+
+        const runAtMs =
+          now +
+          (burstIndex * burstPauseMsFinal) +
+          ((burstIndex * burstSizeFinal + offsetInBurst) * spacingMs);
+
+        const runAt = new Date(runAtMs);
+
+        const trackingId = `${batchId}:${email}:${accepted}`;
+
+        queueDocs.push({
+          trackingId,
+          batchId,
+          email,
+          firstName,
+          lastName,
+          subject,
+          textBody,
+          htmlBody,
+          senderId: String(sender._id),
+          from,
+          replyTo,
+          status: "queued",
+          runAt,
+          createdAt: new Date(),
+        });
+
+        accepted++;
+      }
+
+      // worker pool
+      const workers = Array.from({ length: CONCURRENCY }).map(async () => {
+        while (idx < rows.length && accepted < dailyCap) {
+          const i = idx++;
+          await handleRow(i);
+        }
+      });
+
+      await Promise.all(workers);
+
+      if (queueDocs.length) {
+        await emailQueue.insertMany(queueDocs, { ordered: false });
+      }
+
+      await emailBatches.updateOne(
+        { _id: batchId },
+        {
+          $set: {
+            accepted,
+            rejected,
+            status: "queued", // ✅ done validating, now queued for worker send
+            updatedAt: new Date(),
+          },
+          // optional: keep some reject samples on the batch doc (handy for debugging)
+          $setOnInsert: {},
+        }
+      );
+
+      // optional: if you want, you can store a small sample of rejects on batch:
+      // await emailBatches.updateOne({ _id: batchId }, { $set: { rejectSample: rejects.slice(0, 50) } });
+
+    })().catch(async (err) => {
+      console.error("email/batch background error:", err?.message || err);
+      try {
+        await emailBatches.updateOne(
+          { _id: batchId },
+          { $set: { status: "failed", error: String(err?.message || err), updatedAt: new Date() } }
+        );
+      } catch {}
+    });
+
+  } catch (e) {
+    console.error("email/batch error:", e);
+    return res.status(500).json({ error: e?.message || "failed" });
+  }
+});
+
+
+app.get("/api/email/batch/:batchId", requireAdmin, async (req, res) => {
+  const doc = await emailBatches.findOne({ _id: req.params.batchId });
+  if (!doc) return res.status(404).json({ error: "not_found" });
+  res.json(doc);
+});
+
+app.get("/api/email/failed", requireAdmin, async (req, res) => {
+  const limit = Math.min(Number(req.query.limit || 50), 200);
+  const items = await emailQueue.find({ status: "failed" }).sort({ failedAt: -1 }).limit(limit).toArray();
+  res.json({ items });
+});
+
+app.post("/webhook/email/inbound", upload.any(), async (req, res) => {
+
+  console.log("📩 inbound parsed", {
+  contentType: req.headers["content-type"],
+  bodyKeys: Object.keys(req.body || {}),
+  fromEmail_guess: extractFromEmail(req.body || {}),
+  subject: (req.body?.subject || req.body?.Subject || "").toString().slice(0, 120),
+  textLen: (extractEmailText(req.body || {}) || "").length,
+});
+
+  try {
+    if (req.query.token !== process.env.EMAIL_INBOUND_WEBHOOK_SECRET) {
+      return res.status(401).send("unauthorized");
+    }
+
+    const payload = req.body || {};
+    if (shouldIgnoreEmail(payload)) return res.status(200).json({ ok: true, ignored: "auto" });
+
+    // Provider fields differ. You must map these:
+    const fromEmail = extractFromEmail(payload);
+    const toEmail = extractToEmail(payload); // ✅ the sender inbox that got the inbound
+
+    const subject = String(payload.subject || payload.Subject || payload["subject"] || "").trim();
+
+    const text = extractEmailText(payload);
+    const messageId = extractMessageId(payload);
+
+    const trackingId = messageId || `email:${fromEmail}:${Date.now()}`;
+
+    if (!fromEmail || !text) return res.status(200).json({ ok: true, ignored: "missing_fields" });
+
+    // dedupe
+    try {
+      await emailWebhookEvents.insertOne({ trackingId, createdAt: new Date() });
+    } catch (e) {
+      if (String(e?.code) === "11000") return res.status(200).json({ ok: true, deduped: true });
+      throw e;
+    }
+
+    const userId = normalizeEmailUserId(fromEmail);
+
+    const existing = await emailSessions.findOne({ userId });
+
+    // opt-out guard (email)
+    if (existing?.optedOut) return res.status(200).json({ ok: true, opted_out: true });
+
+    // optional unsubscribe keyword detection
+    const lower = text.toLowerCase();
+    if (lower.includes("unsubscribe") || lower.includes("stop")) {
+      await emailSessions.updateOne(
+        { userId },
+        {
+          $setOnInsert: { userId, createdAt: new Date() },
+          $set: { email: fromEmail, optedOut: true, optedOutAt: new Date(), updatedAt: new Date() },
+          $push: { history: { $each: [{ role: "user", content: text, meta: { subject }, createdAt: new Date() }], $slice: -50 } },
+        },
+        { upsert: true }
+      );
+      return res.status(200).json({ ok: true, opted_out: true });
+    }
+
+    // Save inbound into Email_Sessions
+    await emailSessions.updateOne(
+      { userId },
+      {
+        $setOnInsert: { userId, createdAt: new Date() },
+        $set: {
+          email: fromEmail,
+          updatedAt: new Date(),
+          lastInboundAt: new Date(),
+        },
+        $push: {
+          history: {
+            $each: [{ role: "user", content: text, meta: { subject, messageId }, createdAt: new Date() }],
+            $slice: -50,
+          },
+        },
+      },
+      { upsert: true }
+    );
+
+    // Enqueue reply job (same pattern as SMS)
+await emailReplyJobs.updateOne(
+  { trackingId },
+  {
+    $setOnInsert: {
+      trackingId,
+      userId,
+      toEmail: fromEmail,          // ✅ the customer email (where to reply)
+      inboundToEmail: toEmail || "", // ✅ which of YOUR inboxes received it
+      subject,
+      messageId,
+      text,
+      status: "queued",
+      runAt: new Date(Date.now() + 10_000),
+      createdAt: new Date(),
+    },
+  },
+  { upsert: true }
+);
+
+
+
+    return res.status(200).json({ ok: true, scheduled: true });
+  } catch (e) {
+    console.error("email inbound fatal:", e?.message || e);
+    return res.status(200).json({ ok: false });
+  }
+});
+
+app.get("/api/email/reply-jobs", requireAdmin, async (req, res) => {
+  const limit = Math.min(Number(req.query.limit || 50), 200);
+  const items = await emailReplyJobs.find({})
+    .sort({ createdAt: -1 })
+    .limit(limit)
+    .toArray();
+  res.json({ items });
+});
+
+app.get("/api/email/senders", requireAdmin, async (req, res) => {
+  const items = await emailSenders
+    .find({})
+    .sort({ enabled: -1, createdAt: -1 })
+    .toArray();
+  res.json({ items });
+});
+
+
+app.post("/api/email/senders", requireAdmin, async (req, res) => {
+  const name = String(req.body?.name || "").trim();
+  const email = normalizeEmail(req.body?.email);
+  const replyTo = normalizeEmail(req.body?.replyTo) || "";
+  const enabled = typeof req.body?.enabled === "boolean" ? req.body.enabled : true;
+
+  // NEW signature fields (text + html)
+  const signatureText =
+  String(req.body?.signatureText || req.body?.signature || "").trim();
+
+  const signatureHtml = String(req.body?.signatureHtml || "").trim();
+
+  if (!email) return res.status(400).json({ error: "invalid_email" });
+
+  await emailSenders.updateOne(
+    { email },
+    {
+      $set: {
+        name,
+        email,
+        replyTo,
+        enabled,
+        signatureText,
+        signatureHtml,
+        updatedAt: new Date(),
+      },
+      $setOnInsert: { createdAt: new Date() },
+    },
+    { upsert: true }
+  );
+
+  res.json({ ok: true });
+});
+
+
+app.patch("/api/email/senders/:id", requireAdmin, async (req, res) => {
+  const id = String(req.params.id || "");
+  if (!ObjectId.isValid(id)) return res.status(400).json({ error: "invalid_id" });
+
+  const update = { updatedAt: new Date() };
+
+  if (typeof req.body?.enabled === "boolean") update.enabled = req.body.enabled;
+  if (typeof req.body?.name === "string") update.name = req.body.name.trim();
+  if (typeof req.body?.replyTo === "string") update.replyTo = normalizeEmail(req.body.replyTo) || "";
+  if (typeof req.body?.signatureText === "string") update.signatureText = req.body.signatureText.trim();
+  if (typeof req.body?.signatureHtml === "string") update.signatureHtml = req.body.signatureHtml.trim();
+
+  await emailSenders.updateOne({ _id: new ObjectId(id) }, { $set: update });
+  res.json({ ok: true });
+});
+
+
+app.delete("/api/email/senders/:id", requireAdmin, async (req, res) => {
+  const id = String(req.params.id || "");
+  if (!ObjectId.isValid(id)) return res.status(400).json({ error: "invalid_id" });
+
+  await emailSenders.deleteOne({ _id: new ObjectId(id) });
+  res.json({ ok: true });
+});
+
+
 // Health
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 // Boot
 initDb()
-  .then(() => {
+  .then(async () => {
+    await verifySmtp();
     startReplyWorker();
     startOutboundWorker();
+    startEmailWorker();
+    startEmailReplyWorker();
     app.listen(PORT, () => console.log(`✅ Server listening on :${PORT}`));
   })
   .catch((e) => {

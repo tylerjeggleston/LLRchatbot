@@ -2996,7 +2996,7 @@ app.post("/api/email/batch", async (req, res) => {
     const spacingMs = Math.max(200, Number(req.body?.spacingMs || 800));
     const dailyCap = Math.max(1, Number(req.body?.dailyCap || 5000));
     const burstSizeFinal = Math.max(1, Number(req.body?.burstSize || 100));
-    const burstPauseMsFinal = Math.max(0, Number(req.body?.burstPauseMs || 5 * 60 * 1000)); // 10 min default
+    const burstPauseMsFinal = Math.max(0, Number(req.body?.burstPauseMs || 60 * 1000)); // 10 min default
 
     if (!rows.length) return res.status(400).json({ error: "rows_required" });
     if (rows.length > 20000) return res.status(400).json({ error: "too_many_rows" });
