@@ -21,8 +21,8 @@ app.use(
     allowedHeaders: ["Content-Type", "x-admin-key"],
   })
 );
-app.use(express.urlencoded({ extended: false }));
-app.use(express.json());
+app.use(express.urlencoded({ extended: false, limit: "25mb" }));
+app.use(express.json({ limit: "25mb" }));
 
 // ----------------- Config -----------------
 const PORT = Number(process.env.PORT || 3001);
@@ -2010,7 +2010,7 @@ app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
     await outboundBatches.updateOne(
       { _id: batchId },
       {
-        $set: { accepted, rejected, status: "queued", updatedAt: new Date() },
+        $set: { accepted, rejected, status: "queued", updatedAt: new Date(), nextSeq: accepted },
       }
     );
 
@@ -3043,6 +3043,8 @@ app.post("/api/email/batch", async (req, res) => {
       senderId: singleSender ? String(singleSender._id) : null,
       createdAt: new Date(),
       updatedAt: new Date(),
+      startAtMs: now,
+      nextSeq: 0,
     });
 
     // ✅ Respond immediately so frontend never "Failed to fetch"
@@ -3378,6 +3380,145 @@ app.get("/api/email/senders", requireAdmin, async (req, res) => {
   res.json({ items });
 });
 
+app.post("/api/email/batch/append", async (req, res) => {
+  try {
+    const batchId = String(req.body?.batchId || "").trim();
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    if (!batchId) return res.status(400).json({ error: "batchId_required" });
+    if (!rows.length) return res.status(400).json({ error: "rows_required" });
+
+    const batch = await emailBatches.findOne({ _id: batchId });
+    if (!batch) return res.status(404).json({ error: "batch_not_found" });
+
+    // lock-ish: prevent appending to already-done batches if you want
+    if (["failed"].includes(batch.status)) {
+      return res.status(409).json({ error: "batch_not_appendable" });
+    }
+
+    // bump total immediately so UI reflects progress while validating
+    await emailBatches.updateOne(
+      { _id: batchId },
+      { $inc: { total: rows.length }, $set: { updatedAt: new Date() } }
+    );
+
+    // respond fast so frontend never times out
+    res.status(202).json({ ok: true, batchId, appended: rows.length, status: "validating" });
+
+    // background validate + enqueue (same vibe as your current async path)
+    (async () => {
+      const tpl = await getEmailBlastTemplate();
+      if (!tpl.enabled) throw new Error("email_template_disabled");
+
+      const enabledSenders = await emailSenders.find({ enabled: true }).sort({ createdAt: 1 }).toArray();
+      if (!enabledSenders.length) throw new Error("no_enabled_senders");
+
+      // use existing batch config if present; otherwise fall back
+      const spacingMs = Math.max(200, Number(batch.spacingMs || 800));
+      const dailyCap = Math.max(1, Number(batch.dailyCap || 5000));
+      const burstSizeFinal = Math.max(1, Number(batch.burstSize || 100));
+      const burstPauseMsFinal = Math.max(0, Number(batch.burstPauseMs || 60_000));
+
+      let accepted = 0;
+      let rejected = 0;
+      const queueDocs = [];
+
+      // IMPORTANT: to avoid runAt collisions, base scheduling on a monotonic sequence
+      // We'll reserve a seq range up-front
+      const reserve = await emailBatches.findOneAndUpdate(
+        { _id: batchId },
+        { $inc: { nextSeq: rows.length }, $set: { updatedAt: new Date() } },
+        { returnDocument: "before" }
+      );
+      const startSeq = Number(reserve?.value?.nextSeq || 0);
+
+      for (let i = 0; i < rows.length; i++) {
+        const r = rows[i] || {};
+        const emailRaw = r.email || r.Email || "";
+        const email = normalizeEmail(emailRaw);
+        if (!email) { rejected++; continue; }
+
+        // enforce daily cap based on "sent plan size" if you want strict caps
+        // (keep it simple here)
+        if ((batch.accepted || 0) + accepted >= dailyCap) break;
+
+        let v;
+        try { v = await getEmailValidationCached(email); }
+        catch { rejected++; continue; }
+
+        if (!v?.ok) { rejected++; continue; }
+
+        const firstName = String(r.firstName || r.firstname || "").trim();
+        const lastName = String(r.lastName || r.lastname || "").trim();
+
+        const subject = renderEmail(tpl.subject, { firstName, lastName });
+        const mainText = renderEmail(tpl.body, { firstName, lastName });
+
+        const sender = enabledSenders[(startSeq + i) % enabledSenders.length];
+        const fromEmail = String(sender.email || "").trim();
+        const fromName = String(sender.name || "").trim();
+        const from = fromName ? `${fromName} <${fromEmail}>` : fromEmail;
+        const replyTo = String(sender.replyTo || "").trim();
+
+        const sigTextFinal = renderEmail((sender.signatureText || sender.signature || tpl.signatureText || ""), { firstName, lastName });
+        const sigHtmlFinal = renderEmail((sender.signatureHtml || tpl.signatureHtml || ""), { firstName, lastName });
+        const sigHtmlFallback = sigHtmlFinal || textSigToHtml(sigTextFinal);
+
+        const textBody = [mainText, sigTextFinal].filter(Boolean).join("\n\n").trim();
+
+        const htmlBody =
+          `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.45;color:#111;">` +
+          `${escapeHtmlToParagraphs(mainText)}` +
+          `${sigHtmlFallback ? `<div style="margin-top:16px;">${sigHtmlFallback}</div>` : ""}` +
+          `</div>`;
+
+        const seq = startSeq + i;
+        const burstIndex = Math.floor(seq / burstSizeFinal);
+        const offsetInBurst = seq % burstSizeFinal;
+
+        const runAtMs =
+          Date.now() +
+          (burstIndex * burstPauseMsFinal) +
+          ((burstIndex * burstSizeFinal + offsetInBurst) * spacingMs);
+
+        queueDocs.push({
+          trackingId: `${batchId}:${email}:${seq}`,
+          batchId,
+          email,
+          firstName,
+          lastName,
+          subject,
+          textBody,
+          htmlBody,
+          senderId: String(sender._id),
+          from,
+          replyTo,
+          status: "queued",
+          runAt: new Date(runAtMs),
+          createdAt: new Date(),
+        });
+
+        accepted++;
+      }
+
+      if (queueDocs.length) await emailQueue.insertMany(queueDocs, { ordered: false });
+
+      await emailBatches.updateOne(
+        { _id: batchId },
+        {
+          $inc: { accepted, rejected },
+          $set: { status: "queued", updatedAt: new Date() },
+        }
+      );
+    })().catch(async (err) => {
+      await emailBatches.updateOne(
+        { _id: batchId },
+        { $set: { status: "failed", error: String(err?.message || err), updatedAt: new Date() } }
+      );
+    });
+  } catch (e) {
+    return res.status(500).json({ error: e?.message || "failed" });
+  }
+});
 
 app.post("/api/email/senders", requireAdmin, async (req, res) => {
   const name = String(req.body?.name || "").trim();
