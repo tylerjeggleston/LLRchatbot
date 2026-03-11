@@ -522,23 +522,62 @@ function pickValidationDecision(v) {
   return { ok: false, action: "skip_risky" };
 }
 
-function startOfTodayInTZ(tz = "America/Los_Angeles") {
-  const now = new Date();
-  // Build a YYYY-MM-DD in that TZ, then parse back to Date
+function getZonedParts(date, tz) {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: tz,
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
-  }).formatToParts(now);
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(date);
 
-  const y = parts.find(p => p.type === "year")?.value;
-  const m = parts.find(p => p.type === "month")?.value;
-  const d = parts.find(p => p.type === "day")?.value;
+  const get = (t) => Number(parts.find((p) => p.type === t)?.value || 0);
 
-  // This creates midnight *in that TZ* by formatting then re-parsing as UTC-ish.
-  // Good enough for counting docs since we compare with Date objects.
-  return new Date(`${y}-${m}-${d}T00:00:00.000Z`);
+  return {
+    year: get("year"),
+    month: get("month"),
+    day: get("day"),
+    hour: get("hour"),
+    minute: get("minute"),
+    second: get("second"),
+  };
+}
+
+// Convert a "local time in tz" -> actual UTC Date (iterative correction)
+function zonedTimeToUtc({ year, month, day, hour, minute, second }, tz) {
+  // initial guess: treat the local time as if it were UTC
+  let utcMs = Date.UTC(year, month - 1, day, hour, minute, second);
+
+  // iterate a few times to correct offset / DST
+  for (let i = 0; i < 4; i++) {
+    const got = getZonedParts(new Date(utcMs), tz);
+
+    const diffMinutes =
+      (got.year - year) * 525600 +
+      (got.month - month) * 43200 +
+      (got.day - day) * 1440 +
+      (got.hour - hour) * 60 +
+      (got.minute - minute);
+
+    // seconds don’t matter for midnight boundary
+    if (diffMinutes === 0) break;
+
+    utcMs -= diffMinutes * 60_000;
+  }
+
+  return new Date(utcMs);
+}
+
+function startOfTodayInTZ(tz = "America/Los_Angeles") {
+  const now = new Date();
+  const p = getZonedParts(now, tz);
+  return zonedTimeToUtc(
+    { year: p.year, month: p.month, day: p.day, hour: 0, minute: 0, second: 0 },
+    tz
+  );
 }
 
 
