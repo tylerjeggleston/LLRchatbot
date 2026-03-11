@@ -522,6 +522,25 @@ function pickValidationDecision(v) {
   return { ok: false, action: "skip_risky" };
 }
 
+function startOfTodayInTZ(tz = "Asia/Dhaka") {
+  const now = new Date();
+  // Build a YYYY-MM-DD in that TZ, then parse back to Date
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(now);
+
+  const y = parts.find(p => p.type === "year")?.value;
+  const m = parts.find(p => p.type === "month")?.value;
+  const d = parts.find(p => p.type === "day")?.value;
+
+  // This creates midnight *in that TZ* by formatting then re-parsing as UTC-ish.
+  // Good enough for counting docs since we compare with Date objects.
+  return new Date(`${y}-${m}-${d}T00:00:00.000Z`);
+}
+
 
 async function getEmailValidationCached(email) {
   const address = normalizeEmail(email);
@@ -2930,10 +2949,12 @@ app.get("/api/email/stats", requireAdmin, async (req, res) => {
     for (const r of rows) byStatus[String(r._id || "unknown")] = r.n;
 
     // last 24h sent/failed
-    const since = new Date(Date.now() - 24 * 3600 * 1000);
-    const [sent24h, failed24h] = await Promise.all([
-      emailQueue.countDocuments({ status: "sent", sentAt: { $gte: since } }),
-      emailQueue.countDocuments({ status: "failed", failedAt: { $gte: since } }),
+    const TZ = process.env.STATS_TZ || "America/Los_Angeles";
+    const sinceToday = startOfTodayInTZ(TZ);
+
+    const [sentToday, failedToday] = await Promise.all([
+      emailQueue.countDocuments({ status: "sent", sentAt: { $gte: sinceToday } }),
+      emailQueue.countDocuments({ status: "failed", failedAt: { $gte: sinceToday } }),
     ]);
 
     // ✅ lifetime totals from Email_Batches
@@ -2970,7 +2991,7 @@ app.get("/api/email/stats", requireAdmin, async (req, res) => {
         processing: byStatus.processing || 0,
         skipped: byStatus.skipped || 0,
       },
-      last24h: { sent: sent24h, failed: failed24h },
+      today: { sent: sentToday, failed: failedToday, since: sinceToday.toISOString(), tz: TZ },
 
       // ✅ NEW: lifetime rollups (from batches)
       lifetime: {
