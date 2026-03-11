@@ -2949,7 +2949,7 @@ app.get("/api/email/stats", requireAdmin, async (req, res) => {
     for (const r of rows) byStatus[String(r._id || "unknown")] = r.n;
 
     // last 24h sent/failed
-    const TZ = process.env.STATS_TZ || "Asia/Dhaka";
+    const TZ = process.env.STATS_TZ || "America/Los_Angeles";
     const sinceToday = startOfTodayInTZ(TZ);
 
     const [sentToday, failedToday] = await Promise.all([
