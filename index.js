@@ -522,7 +522,7 @@ function pickValidationDecision(v) {
   return { ok: false, action: "skip_risky" };
 }
 
-function startOfTodayInTZ(tz = "Asia/Dhaka") {
+function startOfTodayInTZ(tz = "America/Los_Angeles") {
   const now = new Date();
   // Build a YYYY-MM-DD in that TZ, then parse back to Date
   const parts = new Intl.DateTimeFormat("en-CA", {
