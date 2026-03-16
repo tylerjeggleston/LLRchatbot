@@ -1961,15 +1961,144 @@ app.post("/api/conversations/:userId/restore", async (req, res) => {
 
 // Create batch: frontend posts rows JSON parsed from CSV
 // Body: { rows: [{ firstName, lastName, phone }], spacingMs?: 5000, defaultCountryCode?: "1" }
+// app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
+//   try {
+//     const { rows, spacingMs, assignedTarget } = req.body;
+
+//     if (!rows.length) return res.status(400).json({ error: "rows_required" });
+//     if (rows.length > 5000) return res.status(400).json({ error: "too_many_rows" });
+
+//     const settings = await getFirstMessageTemplate();
+
+//     const defaultCountryCode = String(req.body?.defaultCountryCode || settings.defaultCountryCode || "1");
+
+//     const batchId = new ObjectId().toString();
+//     const now = Date.now();
+
+//     let accepted = 0;
+//     let rejected = 0;
+//     const rejects = [];
+
+//     // Create batch record
+//     await outboundBatches.insertOne({
+//       _id: batchId,
+//       status: "queued",
+//       total: rows.length,
+//       accepted: 0,
+//       rejected: 0,
+//       sent: 0,
+//       failed: 0,
+//       skipped: 0,
+//       spacingMs,
+//       assignedTarget: assignedTarget || null,
+//       createdAt: new Date(),
+//       updatedAt: new Date(),
+//     });
+
+//     // ✅ Prefetch opted-out userIds for this batch (so we can reject them fast)
+//         const candidateUserIds = [];
+//         for (const r of rows || []) {
+//         const phoneRaw = String(r.phone || r.Phone || r.number || "").trim();
+//         const e164 = normalizeToE164(phoneRaw, defaultCountryCode); // use your existing normalize
+//         if (!e164) continue;
+//         const uid = normalizeUserIdFromPhone(e164); // use your existing userId builder
+//         candidateUserIds.push(uid);
+//         }
+
+//         const optedOutDocs = await sessions
+//         .find(
+//             { userId: { $in: candidateUserIds }, optedOut: true },
+//             { projection: { userId: 1 } }
+//         )
+//         .toArray();
+
+//         const optedOutSet = new Set(optedOutDocs.map(d => d.userId));
+
+
+//     const queueDocs = [];
+//     for (let i = 0; i < rows.length; i++) {
+//       const r = rows[i] || {};
+//       const firstName = String(r.firstName || r.firstname || "").trim();
+//       const lastName = String(r.lastName || r.lastname || "").trim();
+//       const phoneRaw = String(r.phone || r.Phone || r.number || "").trim();
+
+//       const e164 = normalizeToE164(phoneRaw, defaultCountryCode);
+//       if (!e164) {
+//         rejected++;
+//         rejects.push({ index: i, phone: phoneRaw, reason: "invalid_phone" });
+//         continue;
+//       }
+
+//       const uid = normalizeUserIdFromPhone(e164);
+
+//       if (optedOutSet.has(uid)) {
+//         rejected++;
+//         rejects.push({ index: i, phone: e164, reason: "dnc_opted_out" });
+//         continue;
+//         }
+
+//       const message = renderTemplate(settings.template, { firstName, lastName });
+
+//       const burstIndex = burstPauseMsFinal > 0 ? Math.floor(accepted / burstSizeFinal) : 0;
+//       const runAt = new Date(now + accepted * spacingMs + burstIndex * burstPauseMsFinal);
+
+//       const trackingId = `${batchId}:${uid}:${accepted}`;
+
+//       queueDocs.push({
+//         trackingId,
+//         batchId,
+//         userId: uid,
+//         number: e164,
+//         firstName,
+//         lastName,
+//         message,
+//         status: "queued",
+//         runAt,
+//         createdAt: new Date(),
+//       });
+
+//       accepted++;
+//     }
+
+//     if (queueDocs.length) {
+//       // insertMany with ordered:false so one duplicate won't kill everything
+//       await outboundQueue.insertMany(queueDocs, { ordered: false });
+//     }
+
+//     await outboundBatches.updateOne(
+//       { _id: batchId },
+//       {
+//         $set: { accepted, rejected, status: "queued", updatedAt: new Date(), nextSeq: accepted },
+//       }
+//     );
+
+//     res.json({
+//       ok: true,
+//       batchId,
+//       total: rows.length,
+//       accepted,
+//       rejected,
+//       rejects: rejects.slice(0, 50),
+//       spacingMs,
+//     });
+//   } catch (err) {
+//     console.error("outbound/batch error:", err?.message || err);
+//     res.status(500).json({ error: err?.message || "failed" });
+//   }
+// });
+
 app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
   try {
-    const { rows, spacingMs, assignedTarget } = req.body;
+    const { rows, assignedTarget } = req.body;
+
+    const spacingMs = Math.max(200, Number(req.body?.spacingMs || OUTBOUND_SPACING_MS || 5000));
+    const burstSizeFinal = Math.max(1, Number(req.body?.burstSize || 100));
+    const burstPauseMsFinal = Math.max(0, Number(req.body?.burstPauseMs || 60 * 1000));
 
     if (!rows.length) return res.status(400).json({ error: "rows_required" });
     if (rows.length > 5000) return res.status(400).json({ error: "too_many_rows" });
 
     const settings = await getFirstMessageTemplate();
-
     const defaultCountryCode = String(req.body?.defaultCountryCode || settings.defaultCountryCode || "1");
 
     const batchId = new ObjectId().toString();
@@ -1979,7 +2108,6 @@ app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
     let rejected = 0;
     const rejects = [];
 
-    // Create batch record
     await outboundBatches.insertOne({
       _id: batchId,
       status: "queued",
@@ -1990,30 +2118,29 @@ app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
       failed: 0,
       skipped: 0,
       spacingMs,
+      burstSize: burstSizeFinal,
+      burstPauseMs: burstPauseMsFinal,
       assignedTarget: assignedTarget || null,
       createdAt: new Date(),
       updatedAt: new Date(),
     });
 
-    // ✅ Prefetch opted-out userIds for this batch (so we can reject them fast)
-        const candidateUserIds = [];
-        for (const r of rows || []) {
-        const phoneRaw = String(r.phone || r.Phone || r.number || "").trim();
-        const e164 = normalizeToE164(phoneRaw, defaultCountryCode); // use your existing normalize
-        if (!e164) continue;
-        const uid = normalizeUserIdFromPhone(e164); // use your existing userId builder
-        candidateUserIds.push(uid);
-        }
+    const candidateUserIds = [];
+    for (const r of rows || []) {
+      const phoneRaw = String(r.phone || r.Phone || r.number || "").trim();
+      const e164 = normalizeToE164(phoneRaw, defaultCountryCode);
+      if (!e164) continue;
+      candidateUserIds.push(normalizeUserIdFromPhone(e164));
+    }
 
-        const optedOutDocs = await sessions
-        .find(
-            { userId: { $in: candidateUserIds }, optedOut: true },
-            { projection: { userId: 1 } }
-        )
-        .toArray();
+    const optedOutDocs = await sessions
+      .find(
+        { userId: { $in: candidateUserIds }, optedOut: true },
+        { projection: { userId: 1 } }
+      )
+      .toArray();
 
-        const optedOutSet = new Set(optedOutDocs.map(d => d.userId));
-
+    const optedOutSet = new Set(optedOutDocs.map(d => d.userId));
 
     const queueDocs = [];
     for (let i = 0; i < rows.length; i++) {
@@ -2035,12 +2162,16 @@ app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
         rejected++;
         rejects.push({ index: i, phone: e164, reason: "dnc_opted_out" });
         continue;
-        }
+      }
 
       const message = renderTemplate(settings.template, { firstName, lastName });
 
-      const burstIndex = burstPauseMsFinal > 0 ? Math.floor(accepted / burstSizeFinal) : 0;
-      const runAt = new Date(now + accepted * spacingMs + burstIndex * burstPauseMsFinal);
+      const burstIndex =
+        burstPauseMsFinal > 0 ? Math.floor(accepted / burstSizeFinal) : 0;
+
+      const runAt = new Date(
+        now + accepted * spacingMs + burstIndex * burstPauseMsFinal
+      );
 
       const trackingId = `${batchId}:${uid}:${accepted}`;
 
@@ -2061,14 +2192,19 @@ app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
     }
 
     if (queueDocs.length) {
-      // insertMany with ordered:false so one duplicate won't kill everything
       await outboundQueue.insertMany(queueDocs, { ordered: false });
     }
 
     await outboundBatches.updateOne(
       { _id: batchId },
       {
-        $set: { accepted, rejected, status: "queued", updatedAt: new Date(), nextSeq: accepted },
+        $set: {
+          accepted,
+          rejected,
+          status: "queued",
+          updatedAt: new Date(),
+          nextSeq: accepted,
+        },
       }
     );
 
@@ -2080,6 +2216,8 @@ app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
       rejected,
       rejects: rejects.slice(0, 50),
       spacingMs,
+      burstSize: burstSizeFinal,
+      burstPauseMs: burstPauseMsFinal,
     });
   } catch (err) {
     console.error("outbound/batch error:", err?.message || err);
