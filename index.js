@@ -1218,8 +1218,8 @@ function buildComplianceFooter(unsubscribeUrl) {
   const text =
     "You are receiving this email because your business may be interested in lead generation services.\n" +
     "We respect your privacy and do not sell your personal information. Your contact details may have been obtained through publicly available sources or trusted data providers.\n" +
-    `Unsubscribe here: ${unsubscribeUrl}\n` +
     `Privacy Policy: ${privacyUrl}\n` +
+    `Unsubscribe: ${unsubscribeUrl}\n` +
     "Pro Leads Marketing LLC\n" +
     "23811 Washington Ave # C110-103\n" +
     "Murrieta, CA 92562";
@@ -1228,11 +1228,10 @@ function buildComplianceFooter(unsubscribeUrl) {
     `<div style="margin-top:18px;font-size:12px;line-height:1.55;color:#666;border-top:1px solid #e5e7eb;padding-top:14px;">` +
       `<div>You are receiving this email because your business may be interested in lead generation services.</div>` +
       `<div style="margin-top:8px;">We respect your privacy and do not sell your personal information. Your contact details may have been obtained through publicly available sources or trusted data providers.</div>` +
-      `<div style="margin-top:8px;">` +
-        `Unsubscribe here: <a href="${escapeHtml(unsubscribeUrl)}">unsubscribe</a>` +
-      `</div>` +
-      `<div style="margin-top:6px;">` +
-        `Privacy Policy: <a href="https://getleads.leadlockerroom.com/privacy-policy">https://getleads.leadlockerroom.com/privacy-policy</a>` +
+      `<div style="margin-top:10px;">` +
+        `<a href="${escapeHtml(privacyUrl)}" style="color:#666;text-decoration:underline;">Privacy Policy</a>` +
+        ` &nbsp;|&nbsp; ` +
+        `<a href="${escapeHtml(unsubscribeUrl)}" style="color:#666;text-decoration:underline;">Unsubscribe</a>` +
       `</div>` +
       `<div style="margin-top:10px;">` +
         `Pro Leads Marketing LLC<br/>` +
