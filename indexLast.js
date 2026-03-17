@@ -21,8 +21,8 @@ app.use(
     allowedHeaders: ["Content-Type", "x-admin-key"],
   })
 );
-app.use(express.urlencoded({ extended: false }));
-app.use(express.json());
+app.use(express.urlencoded({ extended: false, limit: "25mb" }));
+app.use(express.json({ limit: "25mb" }));
 
 // ----------------- Config -----------------
 const PORT = Number(process.env.PORT || 3001);
@@ -51,25 +51,37 @@ const MAILGUN_DOMAIN = process.env.MAILGUN_DOMAIN;
 const MAILGUN_FROM = process.env.MAILGUN_FROM;
 const MAILGUN_BASE_URL = process.env.MAILGUN_BASE_URL || "https://api.mailgun.net";
 
-async function sendEmailViaMailgun({ to, subject, text, html, headers, from, replyTo }) {
-  if (!MAILGUN_API_KEY || !MAILGUN_DOMAIN) throw new Error("mailgun_not_configured");
+
+
+async function sendEmailViaMailgun({ from, to, subject, text, html, headers }) {
+  if (!MAILGUN_API_KEY || !MAILGUN_DOMAIN) {
+    throw new Error("mailgun_not_configured");
+  }
 
   const url = `${MAILGUN_BASE_URL}/v3/${MAILGUN_DOMAIN}/messages`;
 
   const params = new URLSearchParams();
-  params.append("from", from);              // <-- now dynamic
+
+  // ✅ allow per-message FROM (falls back to env)
+  const fromFinal = String(from || MAILGUN_FROM || "").trim();
+  if (!fromFinal) throw new Error("mailgun_from_missing");
+
+  params.append("from", fromFinal);
   params.append("to", to);
   params.append("subject", subject || "");
   if (text) params.append("text", text);
   if (html) params.append("html", html);
 
-  if (replyTo) params.append("h:Reply-To", replyTo);
-
+  // Custom headers (Mailgun uses h:Header-Name)
   if (headers && typeof headers === "object") {
     for (const [k, v] of Object.entries(headers)) {
       if (v) params.append(`h:${k}`, String(v));
     }
   }
+    // ✅ extra tracing headers
+  if (headers?.["X-LLR-Sender-Id"]) params.append("h:X-LLR-Sender-Id", String(headers["X-LLR-Sender-Id"]));
+  if (headers?.["X-LLR-Sender-Email"]) params.append("h:X-LLR-Sender-Email", String(headers["X-LLR-Sender-Email"]));
+
 
   const resp = await axios.post(url, params, {
     auth: { username: "api", password: MAILGUN_API_KEY },
@@ -121,6 +133,8 @@ let emailWebhookEvents;
 let emailReplyJobs;
 
 let emailSenders;
+let emailValidations;
+
 
 async function initDb() {
   await mongo.connect();
@@ -151,6 +165,7 @@ async function initDb() {
   emailReplyJobs = db.collection("Email_ReplyJobs");
 
   emailSenders = db.collection("Email_Senders");
+  emailValidations = db.collection("Email_Validations");
 
   await emailSenders.createIndex({ email: 1 }, { unique: true });
   await emailSenders.createIndex({ enabled: 1 });
@@ -216,6 +231,16 @@ async function initDb() {
   await emailReplyJobs.createIndex({ trackingId: 1 }, { unique: true });
   await emailReplyJobs.createIndex({ status: 1, runAt: 1 });
 
+  await emailValidations.createIndex({ address: 1 }, { unique: true });
+  await emailQueue.createIndex({ status: 1, sentAt: -1 });
+  await emailQueue.createIndex({ status: 1, failedAt: -1 });
+
+
+  // 2) TTL: auto-expire cache after 30 days
+  await emailValidations.createIndex(
+    { validatedAt: 1 },
+    { expireAfterSeconds: 30 * 24 * 3600 }
+  );
 
 
   console.log("✅ Mongo connected");
@@ -373,29 +398,81 @@ async function processOneEmailReplyJob() {
     }
 
     // Add signature (keep stable)
-    const finalBody =
-      `${replyText}\n\n— Leads Locker Room\nIf you want no more emails, reply “unsubscribe”.`;
+    // ✅ 1) load template (fallback sigs)
+const tpl = await getEmailBlastTemplate();
 
-    // IMPORTANT: preserve threading (if you have messageId)
-    // Nodemailer supports headers:
-    await smtpTransport.sendMail({
-      from: EMAIL_FROM,
-      to: job.toEmail,
-      subject: job.subject?.toLowerCase().startsWith("re:") ? job.subject : `Re: ${job.subject || "Quick question"}`,
-      text: finalBody,
-      headers: job.messageId
-        ? { "In-Reply-To": job.messageId, "References": job.messageId }
-        : undefined,
+// ✅ 2) choose sender that received the inbound
+let sender = null;
+
+// Prefer inboundToEmail (most reliable)
+if (job.inboundToEmail) {
+  sender = await emailSenders.findOne({ email: normalizeEmail(job.inboundToEmail) });
+}
+
+// If not found, fallback: try to decode from message headers you injected
+// (Sometimes providers include your custom header in inbound payload; not always)
+if (!sender && job.senderId && ObjectId.isValid(job.senderId)) {
+  sender = await emailSenders.findOne({ _id: new ObjectId(job.senderId) });
+}
+
+// If still not found, final fallback: first enabled sender (don’t block replies)
+if (!sender) {
+  sender = await emailSenders.findOne({ enabled: true }, { sort: { createdAt: 1 } });
+}
+
+const fromEmail = String(sender?.email || "").trim();
+const fromName = String(sender?.name || "").trim();
+const from = fromName ? `${fromName} <${fromEmail}>` : fromEmail;
+
+const replyTo = String(sender?.replyTo || "").trim();
+
+// ✅ 3) signature: sender override, else template fallback
+const sigTextFinal = String(sender?.signatureText || sender?.signature || tpl.signatureText || "").trim();
+const sigHtmlFinal = String(sender?.signatureHtml || tpl.signatureHtml || "").trim();
+
+
+// ✅ 4) final bodies
+const finalText =
+  [replyText, sigTextFinal].filter(Boolean).join("\n\n").trim();
+
+const sigHtmlFallback = sigHtmlFinal || textSigToHtml(sigTextFinal);
+
+const finalHtml =
+  `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.45;color:#111;">` +
+  `${escapeHtmlToParagraphs(replyText)}` +
+  `${sigHtmlFallback ? `<div style="margin-top:16px;">${sigHtmlFallback}</div>` : ""}` +
+  `</div>`;
+
+
+    // ✅ 5) send via Mailgun using SAME sender
+    await sendEmailViaMailgun({
+    from,
+    to: job.toEmail,
+    subject: job.subject?.toLowerCase().startsWith("re:") ? job.subject : `Re: ${job.subject || "Quick question"}`,
+    text: finalText,
+    html: finalHtml,
+    headers: {
+        ...(replyTo ? { "Reply-To": replyTo } : {}),
+        ...(job.messageId ? { "In-Reply-To": job.messageId, "References": job.messageId } : {}),
+        "X-LLR-Sender-Id": String(sender?._id || ""),
+        "X-LLR-Sender-Email": fromEmail,
+    },
     });
 
-    // Save outbound in session
+    // ✅ Save outbound in session (store the actual body you sent)
     await emailSessions.updateOne(
-      { userId: job.userId },
-      {
-        $set: { updatedAt: new Date() },
-        $push: { history: { $each: [{ role: "assistant", content: finalBody, createdAt: new Date() }], $slice: -50 } }
+  { userId: job.userId },
+  {
+    $set: { updatedAt: new Date() },
+    $push: {
+      history: {
+        $each: [{ role: "assistant", content: finalText, createdAt: new Date() }],
+        $slice: -50
       }
-    );
+    }
+  }
+);
+
 
     await emailReplyJobs.updateOne({ _id: job._id }, { $set: { status: "done", doneAt: new Date() } });
     return true;
@@ -409,6 +486,136 @@ async function processOneEmailReplyJob() {
     return true;
   }
 }
+
+async function validateEmailViaMailgun(address) {
+  if (!MAILGUN_API_KEY) throw new Error("mailgun_not_configured");
+
+  const url = `${MAILGUN_BASE_URL}/v4/address/validate`;
+
+  const resp = await axios.get(url, {
+    auth: { username: "api", password: MAILGUN_API_KEY }, // basicAuth :contentReference[oaicite:2]{index=2}
+    params: { address, provider_lookup: true },            // query params :contentReference[oaicite:3]{index=3}
+    timeout: 30_000,
+  });
+
+  return resp.data;
+}
+
+function pickValidationDecision(v) {
+  const result = String(v?.result || "").toLowerCase();
+  const risk = String(v?.risk || "").toLowerCase();
+
+  // hard blocks for cold outbound
+  if (v?.is_disposable_address) return { ok: false, action: "reject_disposable" };
+  if (v?.is_role_address) return { ok: false, action: "reject_role" };
+
+  // reputation killers / guaranteed pain
+  if (result === "undeliverable" || result === "do_not_send") return { ok: false, action: "reject" };
+
+  // don't send when risk is high even if "deliverable"
+  if (risk === "high") return { ok: false, action: "skip_high_risk" };
+
+  // safe-ish
+  if (result === "deliverable" && (risk === "low" || risk === "medium")) return { ok: true, action: "send" };
+
+  // catch_all / unknown -> skip by default
+  return { ok: false, action: "skip_risky" };
+}
+
+function getZonedParts(date, tz) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(date);
+
+  const get = (t) => Number(parts.find((p) => p.type === t)?.value || 0);
+
+  return {
+    year: get("year"),
+    month: get("month"),
+    day: get("day"),
+    hour: get("hour"),
+    minute: get("minute"),
+    second: get("second"),
+  };
+}
+
+// Convert a "local time in tz" -> actual UTC Date (iterative correction)
+function zonedTimeToUtc({ year, month, day, hour, minute, second }, tz) {
+  // initial guess: treat the local time as if it were UTC
+  let utcMs = Date.UTC(year, month - 1, day, hour, minute, second);
+
+  // iterate a few times to correct offset / DST
+  for (let i = 0; i < 4; i++) {
+    const got = getZonedParts(new Date(utcMs), tz);
+
+    const diffMinutes =
+      (got.year - year) * 525600 +
+      (got.month - month) * 43200 +
+      (got.day - day) * 1440 +
+      (got.hour - hour) * 60 +
+      (got.minute - minute);
+
+    // seconds don’t matter for midnight boundary
+    if (diffMinutes === 0) break;
+
+    utcMs -= diffMinutes * 60_000;
+  }
+
+  return new Date(utcMs);
+}
+
+function startOfTodayInTZ(tz = "America/Los_Angeles") {
+  const now = new Date();
+  const p = getZonedParts(now, tz);
+  return zonedTimeToUtc(
+    { year: p.year, month: p.month, day: p.day, hour: 0, minute: 0, second: 0 },
+    tz
+  );
+}
+
+
+async function getEmailValidationCached(email) {
+  const address = normalizeEmail(email);
+  if (!address) return { ok: false, reason: "invalid_email" };
+
+  // cache hit?
+  const cached = await emailValidations.findOne({ address });
+  if (cached?.payload) {
+    const decision = pickValidationDecision(cached.payload);
+    return { ok: decision.ok, decision, payload: cached.payload, cached: true };
+  }
+
+  // cache miss -> call Mailgun
+  const payload = await validateEmailViaMailgun(address);
+
+  // store
+  await emailValidations.updateOne(
+    { address },
+    {
+      $set: {
+        address,
+        validatedAt: new Date(),
+        payload,
+        result: payload?.result || "",
+        risk: payload?.risk || "",
+        reason: payload?.reason || [],
+      },
+    },
+    { upsert: true }
+  );
+
+  const decision = pickValidationDecision(payload);
+  return { ok: decision.ok, decision, payload, cached: false };
+}
+
+
 
 function startEmailReplyWorker() {
   setInterval(async () => {
@@ -531,6 +738,33 @@ function extractFromEmail(payload) {
   return null;
 }
 
+function extractToEmail(payload) {
+  const direct =
+    payload.recipient ||
+    payload.to ||
+    payload.To ||
+    payload["to"] ||
+    payload["to_email"] ||
+    payload["recipient-email"] ||
+    payload["Delivered-To"];
+
+  if (direct) {
+    const m = String(direct).match(/<([^>]+)>/);
+    const raw = m ? m[1] : direct;
+    return normalizeEmail(raw);
+  }
+
+  // Mailgun commonly gives "recipient"
+  if (payload.envelope) {
+    const env = typeof payload.envelope === "string" ? safeJsonParse(payload.envelope) : payload.envelope;
+    const to = Array.isArray(env?.to) ? env.to[0] : env?.to;
+    if (to) return normalizeEmail(to);
+  }
+
+  return null;
+}
+
+
 function extractEmailText(payload) {
   // Try common plain-text fields first
   const candidates = [
@@ -582,6 +816,12 @@ function extractMessageId(payload) {
   ).trim();
 }
 
+function textSigToHtml(sigText) {
+  const t = String(sigText || "").trim();
+  if (!t) return "";
+  // preserve line breaks nicely
+  return `<div style="white-space:pre-line;">${escapeHtml(t)}</div>`;
+}
 
 
 
@@ -859,19 +1099,30 @@ function renderEmail(template, vars) {
 
 
 async function getEmailBlastTemplate() {
+  const defaults = {
+    key: "email_blast_template",
+    subject: "Quick question, {{firstName}}",
+    body: "Hey {{firstName}},\n\nAre you free for a quick chat?\n",
+    signatureText: "",          // <-- default blank
+    signatureHtml: "",          // <-- default blank
+    flyerImageUrl: "",
+    enabled: true,
+  };
+
   const doc = await emailSettings.findOne({ key: "email_blast_template" });
-  return (
-    doc || {
-      key: "email_blast_template",
-      subject: "Quick question, {{firstName}}",
-      body: "Hey {{firstName}},\n\nAre you free for a quick chat?\n",
-      signatureText: "— Leads Locker Room\nleadslockerroom.com",
-      signatureHtml:
-        "— <b>Leads Locker Room</b><br/><a href='https://leadslockerroom.com'>leadslockerroom.com</a>",
-      flyerImageUrl: "",
-      enabled: true,
+  const merged = { ...defaults, ...(doc || {}) };
+
+  // only backfill subject/body/flyer if blank
+  for (const k of ["subject", "body", "flyerImageUrl"]) {
+    if (typeof merged[k] === "string" && merged[k].trim() === "") {
+      merged[k] = defaults[k];
     }
-  );
+  }
+
+  // DO NOT backfill signature fields — blank should mean “no template signature”
+  if (typeof merged.enabled !== "boolean") merged.enabled = true;
+
+  return merged;
 }
 
 
@@ -921,13 +1172,20 @@ async function processOneEmailJob() {
     // await sendEmailViaSendGrid({ to: job.email, subject: job.subject, text: job.body });
     // await sendEmailViaSMTP({ to: job.email, subject: job.subject, text: job.body });
 await sendEmailViaMailgun({
+  from: job.from,
   to: job.email,
   subject: job.subject,
   text: job.textBody || job.body,
   html: job.htmlBody || undefined,
-  from: job.from,                // ✅ dynamic sender
-  replyTo: job.replyTo || "",    // ✅ optional
+  headers: {
+    ...(job.replyTo ? { "Reply-To": job.replyTo } : {}),
+    "X-LLR-Sender-Id": job.senderId || "",
+    "X-LLR-Sender-Email": (String(job.from || "").match(/<([^>]+)>/)?.[1] || job.from || ""),
+  },
 });
+
+
+
 
     await emailQueue.updateOne(
       { _id: job._id },
@@ -1703,15 +1961,144 @@ app.post("/api/conversations/:userId/restore", async (req, res) => {
 
 // Create batch: frontend posts rows JSON parsed from CSV
 // Body: { rows: [{ firstName, lastName, phone }], spacingMs?: 5000, defaultCountryCode?: "1" }
+// app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
+//   try {
+//     const { rows, spacingMs, assignedTarget } = req.body;
+
+//     if (!rows.length) return res.status(400).json({ error: "rows_required" });
+//     if (rows.length > 5000) return res.status(400).json({ error: "too_many_rows" });
+
+//     const settings = await getFirstMessageTemplate();
+
+//     const defaultCountryCode = String(req.body?.defaultCountryCode || settings.defaultCountryCode || "1");
+
+//     const batchId = new ObjectId().toString();
+//     const now = Date.now();
+
+//     let accepted = 0;
+//     let rejected = 0;
+//     const rejects = [];
+
+//     // Create batch record
+//     await outboundBatches.insertOne({
+//       _id: batchId,
+//       status: "queued",
+//       total: rows.length,
+//       accepted: 0,
+//       rejected: 0,
+//       sent: 0,
+//       failed: 0,
+//       skipped: 0,
+//       spacingMs,
+//       assignedTarget: assignedTarget || null,
+//       createdAt: new Date(),
+//       updatedAt: new Date(),
+//     });
+
+//     // ✅ Prefetch opted-out userIds for this batch (so we can reject them fast)
+//         const candidateUserIds = [];
+//         for (const r of rows || []) {
+//         const phoneRaw = String(r.phone || r.Phone || r.number || "").trim();
+//         const e164 = normalizeToE164(phoneRaw, defaultCountryCode); // use your existing normalize
+//         if (!e164) continue;
+//         const uid = normalizeUserIdFromPhone(e164); // use your existing userId builder
+//         candidateUserIds.push(uid);
+//         }
+
+//         const optedOutDocs = await sessions
+//         .find(
+//             { userId: { $in: candidateUserIds }, optedOut: true },
+//             { projection: { userId: 1 } }
+//         )
+//         .toArray();
+
+//         const optedOutSet = new Set(optedOutDocs.map(d => d.userId));
+
+
+//     const queueDocs = [];
+//     for (let i = 0; i < rows.length; i++) {
+//       const r = rows[i] || {};
+//       const firstName = String(r.firstName || r.firstname || "").trim();
+//       const lastName = String(r.lastName || r.lastname || "").trim();
+//       const phoneRaw = String(r.phone || r.Phone || r.number || "").trim();
+
+//       const e164 = normalizeToE164(phoneRaw, defaultCountryCode);
+//       if (!e164) {
+//         rejected++;
+//         rejects.push({ index: i, phone: phoneRaw, reason: "invalid_phone" });
+//         continue;
+//       }
+
+//       const uid = normalizeUserIdFromPhone(e164);
+
+//       if (optedOutSet.has(uid)) {
+//         rejected++;
+//         rejects.push({ index: i, phone: e164, reason: "dnc_opted_out" });
+//         continue;
+//         }
+
+//       const message = renderTemplate(settings.template, { firstName, lastName });
+
+//       const burstIndex = burstPauseMsFinal > 0 ? Math.floor(accepted / burstSizeFinal) : 0;
+//       const runAt = new Date(now + accepted * spacingMs + burstIndex * burstPauseMsFinal);
+
+//       const trackingId = `${batchId}:${uid}:${accepted}`;
+
+//       queueDocs.push({
+//         trackingId,
+//         batchId,
+//         userId: uid,
+//         number: e164,
+//         firstName,
+//         lastName,
+//         message,
+//         status: "queued",
+//         runAt,
+//         createdAt: new Date(),
+//       });
+
+//       accepted++;
+//     }
+
+//     if (queueDocs.length) {
+//       // insertMany with ordered:false so one duplicate won't kill everything
+//       await outboundQueue.insertMany(queueDocs, { ordered: false });
+//     }
+
+//     await outboundBatches.updateOne(
+//       { _id: batchId },
+//       {
+//         $set: { accepted, rejected, status: "queued", updatedAt: new Date(), nextSeq: accepted },
+//       }
+//     );
+
+//     res.json({
+//       ok: true,
+//       batchId,
+//       total: rows.length,
+//       accepted,
+//       rejected,
+//       rejects: rejects.slice(0, 50),
+//       spacingMs,
+//     });
+//   } catch (err) {
+//     console.error("outbound/batch error:", err?.message || err);
+//     res.status(500).json({ error: err?.message || "failed" });
+//   }
+// });
+
 app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
   try {
-    const { rows, spacingMs, assignedTarget } = req.body;
+    const { rows, assignedTarget } = req.body;
+
+    const spacingMs = Math.max(200, Number(req.body?.spacingMs || OUTBOUND_SPACING_MS || 5000));
+    const burstSizeFinal = Math.max(1, Number(req.body?.burstSize || 100));
+    const burstPauseMsFinal = Math.max(0, Number(req.body?.burstPauseMs || 60 * 1000));
 
     if (!rows.length) return res.status(400).json({ error: "rows_required" });
     if (rows.length > 5000) return res.status(400).json({ error: "too_many_rows" });
 
     const settings = await getFirstMessageTemplate();
-
     const defaultCountryCode = String(req.body?.defaultCountryCode || settings.defaultCountryCode || "1");
 
     const batchId = new ObjectId().toString();
@@ -1721,7 +2108,6 @@ app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
     let rejected = 0;
     const rejects = [];
 
-    // Create batch record
     await outboundBatches.insertOne({
       _id: batchId,
       status: "queued",
@@ -1732,30 +2118,29 @@ app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
       failed: 0,
       skipped: 0,
       spacingMs,
+      burstSize: burstSizeFinal,
+      burstPauseMs: burstPauseMsFinal,
       assignedTarget: assignedTarget || null,
       createdAt: new Date(),
       updatedAt: new Date(),
     });
 
-    // ✅ Prefetch opted-out userIds for this batch (so we can reject them fast)
-        const candidateUserIds = [];
-        for (const r of rows || []) {
-        const phoneRaw = String(r.phone || r.Phone || r.number || "").trim();
-        const e164 = normalizeToE164(phoneRaw, defaultCountryCode); // use your existing normalize
-        if (!e164) continue;
-        const uid = normalizeUserIdFromPhone(e164); // use your existing userId builder
-        candidateUserIds.push(uid);
-        }
+    const candidateUserIds = [];
+    for (const r of rows || []) {
+      const phoneRaw = String(r.phone || r.Phone || r.number || "").trim();
+      const e164 = normalizeToE164(phoneRaw, defaultCountryCode);
+      if (!e164) continue;
+      candidateUserIds.push(normalizeUserIdFromPhone(e164));
+    }
 
-        const optedOutDocs = await sessions
-        .find(
-            { userId: { $in: candidateUserIds }, optedOut: true },
-            { projection: { userId: 1 } }
-        )
-        .toArray();
+    const optedOutDocs = await sessions
+      .find(
+        { userId: { $in: candidateUserIds }, optedOut: true },
+        { projection: { userId: 1 } }
+      )
+      .toArray();
 
-        const optedOutSet = new Set(optedOutDocs.map(d => d.userId));
-
+    const optedOutSet = new Set(optedOutDocs.map(d => d.userId));
 
     const queueDocs = [];
     for (let i = 0; i < rows.length; i++) {
@@ -1777,11 +2162,17 @@ app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
         rejected++;
         rejects.push({ index: i, phone: e164, reason: "dnc_opted_out" });
         continue;
-        }
+      }
 
       const message = renderTemplate(settings.template, { firstName, lastName });
 
-      const runAt = new Date(now + accepted * spacingMs); // 5s between accepted sends
+      const burstIndex =
+        burstPauseMsFinal > 0 ? Math.floor(accepted / burstSizeFinal) : 0;
+
+      const runAt = new Date(
+        now + accepted * spacingMs + burstIndex * burstPauseMsFinal
+      );
+
       const trackingId = `${batchId}:${uid}:${accepted}`;
 
       queueDocs.push({
@@ -1801,14 +2192,19 @@ app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
     }
 
     if (queueDocs.length) {
-      // insertMany with ordered:false so one duplicate won't kill everything
       await outboundQueue.insertMany(queueDocs, { ordered: false });
     }
 
     await outboundBatches.updateOne(
       { _id: batchId },
       {
-        $set: { accepted, rejected, status: "queued", updatedAt: new Date() },
+        $set: {
+          accepted,
+          rejected,
+          status: "queued",
+          updatedAt: new Date(),
+          nextSeq: accepted,
+        },
       }
     );
 
@@ -1820,6 +2216,8 @@ app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
       rejected,
       rejects: rejects.slice(0, 50),
       spacingMs,
+      burstSize: burstSizeFinal,
+      burstPauseMs: burstPauseMsFinal,
     });
   } catch (err) {
     console.error("outbound/batch error:", err?.message || err);
@@ -2717,13 +3115,86 @@ app.post("/api/email/template", async (req, res) => {
   res.json({ ok: true });
 });
 
+app.get("/api/email/stats", requireAdmin, async (req, res) => {
+  try {
+    // counts by status (queued/processing/sent/failed/etc.)
+    const rows = await emailQueue.aggregate([
+      { $group: { _id: "$status", n: { $sum: 1 } } },
+    ]).toArray();
 
-// Body: { rows: [{ email, firstName?, lastName? }], spacingMs?: number }
+    const byStatus = {};
+    for (const r of rows) byStatus[String(r._id || "unknown")] = r.n;
+
+    // last 24h sent/failed
+    const TZ = process.env.STATS_TZ || "America/Los_Angeles";
+    const sinceToday = startOfTodayInTZ(TZ);
+
+    const [sentToday, failedToday] = await Promise.all([
+      emailQueue.countDocuments({ status: "sent", sentAt: { $gte: sinceToday } }),
+      emailQueue.countDocuments({ status: "failed", failedAt: { $gte: sinceToday } }),
+    ]);
+
+    // ✅ lifetime totals from Email_Batches
+    const batchAgg = await emailBatches.aggregate([
+      {
+        $group: {
+          _id: null,
+          lifetimeTotal: { $sum: { $ifNull: ["$total", 0] } },
+          lifetimeAccepted: { $sum: { $ifNull: ["$accepted", 0] } },
+          lifetimeRejected: { $sum: { $ifNull: ["$rejected", 0] } },
+          lifetimeSent: { $sum: { $ifNull: ["$sent", 0] } },
+          lifetimeFailed: { $sum: { $ifNull: ["$failed", 0] } },
+          lifetimeSkipped: { $sum: { $ifNull: ["$skipped", 0] } },
+        },
+      },
+    ]).toArray();
+
+    const b = batchAgg?.[0] || {
+      lifetimeTotal: 0,
+      lifetimeAccepted: 0,
+      lifetimeRejected: 0,
+      lifetimeSent: 0,
+      lifetimeFailed: 0,
+      lifetimeSkipped: 0,
+    };
+
+    res.json({
+      ok: true,
+      byStatus,
+      totals: {
+        sent: byStatus.sent || 0,
+        failed: byStatus.failed || 0,
+        queued: byStatus.queued || 0,
+        processing: byStatus.processing || 0,
+        skipped: byStatus.skipped || 0,
+      },
+      today: { sent: sentToday, failed: failedToday, since: sinceToday.toISOString(), tz: TZ },
+
+      // ✅ NEW: lifetime rollups (from batches)
+      lifetime: {
+        total: b.lifetimeTotal,
+        accepted: b.lifetimeAccepted,
+        rejected: b.lifetimeRejected,
+        sent: b.lifetimeSent,
+        failed: b.lifetimeFailed,
+        skipped: b.lifetimeSkipped,
+      },
+    });
+  } catch (e) {
+    console.error("email stats error:", e?.message || e);
+    res.status(500).json({ ok: false, error: "failed_to_load_stats" });
+  }
+});
+
+
+
 app.post("/api/email/batch", async (req, res) => {
   try {
     const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
-    const spacingMs = Math.max(200, Number(req.body?.spacingMs || 800)); // keep sane
+    const spacingMs = Math.max(200, Number(req.body?.spacingMs || 800));
     const dailyCap = Math.max(1, Number(req.body?.dailyCap || 5000));
+    const burstSizeFinal = Math.max(1, Number(req.body?.burstSize || 100));
+    const burstPauseMsFinal = Math.max(0, Number(req.body?.burstPauseMs || 60 * 1000)); // 10 min default
 
     if (!rows.length) return res.status(400).json({ error: "rows_required" });
     if (rows.length > 20000) return res.status(400).json({ error: "too_many_rows" });
@@ -2731,12 +3202,31 @@ app.post("/api/email/batch", async (req, res) => {
     const tpl = await getEmailBlastTemplate();
     if (!tpl.enabled) return res.status(409).json({ error: "email_template_disabled" });
 
+    // ✅ fetch enabled senders ONCE
+    const enabledSenders = await emailSenders
+      .find({ enabled: true })
+      .sort({ createdAt: 1 })
+      .toArray();
+
+    if (!enabledSenders.length) return res.status(409).json({ error: "no_enabled_senders" });
+
+    const senderMode = String(req.body?.senderMode || "auto"); // "auto" | "single"
+    const senderIdRaw = String(req.body?.senderId || "").trim();
+
+    let singleSender = null;
+    if (senderMode === "single") {
+      if (!ObjectId.isValid(senderIdRaw)) return res.status(400).json({ error: "invalid_senderId" });
+      singleSender = enabledSenders.find((s) => String(s._id) === senderIdRaw) || null;
+      if (!singleSender) return res.status(409).json({ error: "sender_not_found_or_disabled" });
+    }
+
     const batchId = new ObjectId().toString();
     const now = Date.now();
 
+    // ✅ Create batch immediately with "validating" state
     await emailBatches.insertOne({
       _id: batchId,
-      status: "queued",
+      status: "validating", // ✅ NEW
       total: rows.length,
       accepted: 0,
       rejected: 0,
@@ -2745,125 +3235,210 @@ app.post("/api/email/batch", async (req, res) => {
       skipped: 0,
       spacingMs,
       dailyCap,
+      burstSize: burstSizeFinal,
+      burstPauseMs: burstPauseMsFinal,
+      senderMode,
+      senderId: singleSender ? String(singleSender._id) : null,
       createdAt: new Date(),
       updatedAt: new Date(),
+      startAtMs: now,
+      nextSeq: 0,
     });
 
-    let accepted = 0;
-    let rejected = 0;
-    const rejects = [];
-    const queueDocs = [];
-
-    for (let i = 0; i < rows.length; i++) {
-      const r = rows[i] || {};
-      const emailRaw = r.email || r.Email || "";
-      const email = normalizeEmail(emailRaw);
-      if (!email) {
-        rejected++;
-        rejects.push({ index: i, email: String(emailRaw), reason: "invalid_email" });
-        continue;
-      }
-
-      const firstName = String(r.firstName || r.firstname || "").trim();
-      const lastName = String(r.lastName || r.lastname || "").trim();
-
-      const subject = renderEmail(tpl.subject, { firstName, lastName });
-
-      const mainText = renderEmail(tpl.body, { firstName, lastName });
-      const sigText = renderEmail(tpl.signatureText || "", { firstName, lastName });
-      const textBody = [mainText, sigText].filter(Boolean).join("\n\n").trim();
-
-      // HTML version (minimal + safe)
-      const safeFlyerUrl = String(tpl.flyerImageUrl || "").trim();
-      const flyerHtml = safeFlyerUrl
-        ? `<div style="margin-top:12px;"><img src="${safeFlyerUrl}" alt="Leads Locker Room" style="max-width:600px;width:100%;height:auto;border:0;" /></div>`
-        : "";
-
-      const sigHtmlRaw = tpl.signatureHtml || "";
-      const sigHtml = renderEmail(sigHtmlRaw, { firstName, lastName });
-
-      const htmlBody =
-        `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.45;color:#111;">` +
-        `${escapeHtmlToParagraphs(mainText)}` +
-        `${sigHtml ? `<div style="margin-top:16px;">${sigHtml}</div>` : ""}` +
-        `${flyerHtml}` +
-        `</div>`;
-
-      const runAt = new Date(now + accepted * spacingMs);
-      const trackingId = `${batchId}:${email}:${accepted}`;
-
-      const senders = await emailSenders
-        .find({ enabled: true })
-        .sort({ createdAt: 1 })
-        .toArray();
-
-        if (!senders.length) {
-        return res.status(409).json({ error: "no_enabled_senders" });
-        }
-
-
-      const sender = senders[accepted % senders.length];
-
-const fromEmail = String(sender.email || "").trim();
-const fromName = String(sender.name || "").trim();
-const from = fromName ? `${fromName} <${fromEmail}>` : fromEmail;
-
-queueDocs.push({
-  trackingId,
-  batchId,
-  email,
-  firstName,
-  lastName,
-  subject,
-  textBody,
-  htmlBody,
-
-  // ✅ sender snapshot on the job
-  senderId: sender._id,
-  from,
-  replyTo: sender.replyTo || "",
-
-  status: "queued",
-  runAt,
-  createdAt: new Date(),
-});
-
-
-      accepted++;
-      if (accepted >= dailyCap) break; // hard cap safety
-    }
-
-    if (queueDocs.length) {
-      await emailQueue.insertMany(queueDocs, { ordered: false });
-    }
-
-    await emailBatches.updateOne(
-      { _id: batchId },
-      {
-        $set: {
-          accepted,
-          rejected,
-          status: "queued",
-          updatedAt: new Date(),
-        },
-      }
-    );
-
-    res.json({
+    // ✅ Respond immediately so frontend never "Failed to fetch"
+    // Frontend already polls /api/email/batch/:batchId, so it will update.
+    res.status(202).json({
       ok: true,
       batchId,
       total: rows.length,
-      accepted,
-      rejected,
-      rejects: rejects.slice(0, 50),
+      accepted: 0,
+      rejected: 0,
+      status: "validating",
       spacingMs,
       dailyCap,
+      senderMode,
+      senderId: singleSender ? String(singleSender._id) : null,
+      burstSize: burstSizeFinal,
+      burstPauseMs: burstPauseMsFinal,
     });
+
+    // ------------------------------------------------------------
+    // Background validation + enqueue (keeps your old perfect filtering)
+    // ------------------------------------------------------------
+    (async () => {
+      let accepted = 0;
+      let rejected = 0;
+      const rejects = [];
+      const queueDocs = [];
+
+      // simple concurrency limiter (no new deps)
+      const CONCURRENCY = 8; // tune: 4-12 is usually fine
+      let idx = 0;
+
+      async function handleRow(i) {
+        const r = rows[i] || {};
+        const emailRaw = r.email || r.Email || "";
+        const email = normalizeEmail(emailRaw);
+
+        if (!email) {
+          rejected++;
+          rejects.push({ index: i, email: String(emailRaw), reason: "invalid_email" });
+          return;
+        }
+
+        // stop if daily cap hit
+        if (accepted >= dailyCap) return;
+
+        // ✅ Mailgun deliverability validation BEFORE enqueue (same as your old behavior)
+        let v;
+        try {
+          v = await getEmailValidationCached(email);
+        } catch (e) {
+          rejected++;
+          rejects.push({
+            index: i,
+            email,
+            reason: "validation_error",
+            detail: e?.message || String(e),
+          });
+          return;
+        }
+
+        if (!v?.ok) {
+          rejected++;
+          rejects.push({
+            index: i,
+            email,
+            reason: `not_sendable:${String(v?.payload?.result || "unknown")}`,
+            risk: String(v?.payload?.risk || ""),
+            why: Array.isArray(v?.payload?.reason) ? v.payload.reason : [],
+            action: v?.decision?.action || "skip",
+          });
+          return;
+        }
+
+        const firstName = String(r.firstName || r.firstname || "").trim();
+        const lastName = String(r.lastName || r.lastname || "").trim();
+
+        const subject = renderEmail(tpl.subject, { firstName, lastName });
+        const mainText = renderEmail(tpl.body, { firstName, lastName });
+
+        const safeFlyerUrl = String(tpl.flyerImageUrl || "").trim();
+        const flyerHtml = safeFlyerUrl
+          ? `<div style="margin-top:12px;"><img src="${safeFlyerUrl}" alt="Leads Locker Room" style="max-width:600px;width:100%;height:auto;border:0;" /></div>`
+          : "";
+
+        // ✅ pick sender
+        const sender = singleSender || enabledSenders[accepted % enabledSenders.length];
+
+        const fromEmail = String(sender.email || "").trim();
+        const fromName = String(sender.name || "").trim();
+        const from = fromName ? `${fromName} <${fromEmail}>` : fromEmail;
+
+        const replyTo = String(sender.replyTo || "").trim();
+
+        // ✅ sender signature overrides template signature
+        const sigTextFinal = renderEmail(
+          (sender.signatureText || sender.signature || tpl.signatureText || ""),
+          { firstName, lastName }
+        );
+
+        const sigHtmlFinal = renderEmail(
+          (sender.signatureHtml || tpl.signatureHtml || ""),
+          { firstName, lastName }
+        );
+
+        const sigHtmlFallback = sigHtmlFinal || textSigToHtml(sigTextFinal);
+
+        const textBody = [mainText, sigTextFinal].filter(Boolean).join("\n\n").trim();
+
+        const htmlBody =
+          `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.45;color:#111;">` +
+          `${escapeHtmlToParagraphs(mainText)}` +
+          `${sigHtmlFallback ? `<div style="margin-top:16px;">${sigHtmlFallback}</div>` : ""}` +
+          `${flyerHtml}` +
+          `</div>`;
+
+        const burstIndex = Math.floor(accepted / burstSizeFinal);
+        const offsetInBurst = accepted % burstSizeFinal;
+
+        const runAtMs =
+          now +
+          (burstIndex * burstPauseMsFinal) +
+          ((burstIndex * burstSizeFinal + offsetInBurst) * spacingMs);
+
+        const runAt = new Date(runAtMs);
+
+        const trackingId = `${batchId}:${email}:${accepted}`;
+
+        queueDocs.push({
+          trackingId,
+          batchId,
+          email,
+          firstName,
+          lastName,
+          subject,
+          textBody,
+          htmlBody,
+          senderId: String(sender._id),
+          from,
+          replyTo,
+          status: "queued",
+          runAt,
+          createdAt: new Date(),
+        });
+
+        accepted++;
+      }
+
+      // worker pool
+      const workers = Array.from({ length: CONCURRENCY }).map(async () => {
+        while (idx < rows.length && accepted < dailyCap) {
+          const i = idx++;
+          await handleRow(i);
+        }
+      });
+
+      await Promise.all(workers);
+
+      if (queueDocs.length) {
+        await emailQueue.insertMany(queueDocs, { ordered: false });
+      }
+
+      await emailBatches.updateOne(
+        { _id: batchId },
+        {
+          $set: {
+            accepted,
+            rejected,
+            status: "queued", // ✅ done validating, now queued for worker send
+            updatedAt: new Date(),
+            nextSeq: accepted,
+          },
+          // optional: keep some reject samples on the batch doc (handy for debugging)
+          $setOnInsert: {},
+        }
+      );
+
+      // optional: if you want, you can store a small sample of rejects on batch:
+      // await emailBatches.updateOne({ _id: batchId }, { $set: { rejectSample: rejects.slice(0, 50) } });
+
+    })().catch(async (err) => {
+      console.error("email/batch background error:", err?.message || err);
+      try {
+        await emailBatches.updateOne(
+          { _id: batchId },
+          { $set: { status: "failed", error: String(err?.message || err), updatedAt: new Date() } }
+        );
+      } catch {}
+    });
+
   } catch (e) {
     console.error("email/batch error:", e);
-    res.status(500).json({ error: "failed" });
+    return res.status(500).json({ error: e?.message || "failed" });
   }
 });
+
 
 app.get("/api/email/batch/:batchId", requireAdmin, async (req, res) => {
   const doc = await emailBatches.findOne({ _id: req.params.batchId });
@@ -2897,6 +3472,8 @@ app.post("/webhook/email/inbound", upload.any(), async (req, res) => {
 
     // Provider fields differ. You must map these:
     const fromEmail = extractFromEmail(payload);
+    const toEmail = extractToEmail(payload); // ✅ the sender inbox that got the inbound
+
     const subject = String(payload.subject || payload.Subject || payload["subject"] || "").trim();
 
     const text = extractEmailText(payload);
@@ -2957,23 +3534,26 @@ app.post("/webhook/email/inbound", upload.any(), async (req, res) => {
     );
 
     // Enqueue reply job (same pattern as SMS)
-    await emailReplyJobs.updateOne(
-      { trackingId },
-      {
-        $setOnInsert: {
-          trackingId,
-          userId,
-          toEmail: fromEmail,
-          subject,
-          messageId,
-          text,
-          status: "queued",
-          runAt: new Date(Date.now() + 10_000),
-          createdAt: new Date(),
-        },
-      },
-      { upsert: true }
-    );
+await emailReplyJobs.updateOne(
+  { trackingId },
+  {
+    $setOnInsert: {
+      trackingId,
+      userId,
+      toEmail: fromEmail,          // ✅ the customer email (where to reply)
+      inboundToEmail: toEmail || "", // ✅ which of YOUR inboxes received it
+      subject,
+      messageId,
+      text,
+      status: "queued",
+      runAt: new Date(Date.now() + 10_000),
+      createdAt: new Date(),
+    },
+  },
+  { upsert: true }
+);
+
+
 
     return res.status(200).json({ ok: true, scheduled: true });
   } catch (e) {
@@ -2992,23 +3572,181 @@ app.get("/api/email/reply-jobs", requireAdmin, async (req, res) => {
 });
 
 app.get("/api/email/senders", requireAdmin, async (req, res) => {
-  const items = await emailSenders.find({}).sort({ createdAt: -1 }).toArray();
+  const items = await emailSenders
+    .find({})
+    .sort({ enabled: -1, createdAt: -1 })
+    .toArray();
   res.json({ items });
+});
+
+app.post("/api/email/batch/append", async (req, res) => {
+  try {
+    const batchId = String(req.body?.batchId || "").trim();
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    if (!batchId) return res.status(400).json({ error: "batchId_required" });
+    if (!rows.length) return res.status(400).json({ error: "rows_required" });
+
+    const batch = await emailBatches.findOne({ _id: batchId });
+    if (!batch) return res.status(404).json({ error: "batch_not_found" });
+
+    // lock-ish: prevent appending to already-done batches if you want
+    if (["failed"].includes(batch.status)) {
+      return res.status(409).json({ error: "batch_not_appendable" });
+    }
+
+    // bump total immediately so UI reflects progress while validating
+    await emailBatches.updateOne(
+      { _id: batchId },
+      { $inc: { total: rows.length }, $set: { updatedAt: new Date() } }
+    );
+
+    // respond fast so frontend never times out
+    res.status(202).json({ ok: true, batchId, appended: rows.length, status: "validating" });
+
+    // background validate + enqueue (same vibe as your current async path)
+    (async () => {
+      const tpl = await getEmailBlastTemplate();
+      if (!tpl.enabled) throw new Error("email_template_disabled");
+
+      const enabledSenders = await emailSenders.find({ enabled: true }).sort({ createdAt: 1 }).toArray();
+      if (!enabledSenders.length) throw new Error("no_enabled_senders");
+
+      // use existing batch config if present; otherwise fall back
+      const spacingMs = Math.max(200, Number(batch.spacingMs || 800));
+      const dailyCap = Math.max(1, Number(batch.dailyCap || 5000));
+      const burstSizeFinal = Math.max(1, Number(batch.burstSize || 100));
+      const burstPauseMsFinal = Math.max(0, Number(batch.burstPauseMs || 60_000));
+
+      let accepted = 0;
+      let rejected = 0;
+      const queueDocs = [];
+
+      // IMPORTANT: to avoid runAt collisions, base scheduling on a monotonic sequence
+      // We'll reserve a seq range up-front
+      const reserve = await emailBatches.findOneAndUpdate(
+        { _id: batchId },
+        { $inc: { nextSeq: rows.length }, $set: { updatedAt: new Date() } },
+        { returnDocument: "before" }
+      );
+      const startSeq = Number(reserve?.value?.nextSeq || 0);
+
+      for (let i = 0; i < rows.length; i++) {
+        const r = rows[i] || {};
+        const emailRaw = r.email || r.Email || "";
+        const email = normalizeEmail(emailRaw);
+        if (!email) { rejected++; continue; }
+
+        // enforce daily cap based on "sent plan size" if you want strict caps
+        // (keep it simple here)
+        if ((batch.accepted || 0) + accepted >= dailyCap) break;
+
+        let v;
+        try { v = await getEmailValidationCached(email); }
+        catch { rejected++; continue; }
+
+        if (!v?.ok) { rejected++; continue; }
+
+        const firstName = String(r.firstName || r.firstname || "").trim();
+        const lastName = String(r.lastName || r.lastname || "").trim();
+
+        const subject = renderEmail(tpl.subject, { firstName, lastName });
+        const mainText = renderEmail(tpl.body, { firstName, lastName });
+
+        const sender = enabledSenders[(startSeq + i) % enabledSenders.length];
+        const fromEmail = String(sender.email || "").trim();
+        const fromName = String(sender.name || "").trim();
+        const from = fromName ? `${fromName} <${fromEmail}>` : fromEmail;
+        const replyTo = String(sender.replyTo || "").trim();
+
+        const sigTextFinal = renderEmail((sender.signatureText || sender.signature || tpl.signatureText || ""), { firstName, lastName });
+        const sigHtmlFinal = renderEmail((sender.signatureHtml || tpl.signatureHtml || ""), { firstName, lastName });
+        const sigHtmlFallback = sigHtmlFinal || textSigToHtml(sigTextFinal);
+
+        const textBody = [mainText, sigTextFinal].filter(Boolean).join("\n\n").trim();
+
+        const htmlBody =
+          `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.45;color:#111;">` +
+          `${escapeHtmlToParagraphs(mainText)}` +
+          `${sigHtmlFallback ? `<div style="margin-top:16px;">${sigHtmlFallback}</div>` : ""}` +
+          `</div>`;
+
+        const seq = startSeq + i;
+        const burstIndex = Math.floor(seq / burstSizeFinal);
+        const offsetInBurst = seq % burstSizeFinal;
+
+        const base = Number(batch.startAtMs || Date.now());
+
+        const runAtMs =
+          base +
+          (burstIndex * burstPauseMsFinal) +
+          ((burstIndex * burstSizeFinal + offsetInBurst) * spacingMs);
+
+        queueDocs.push({
+          trackingId: `${batchId}:${email}:${seq}`,
+          batchId,
+          email,
+          firstName,
+          lastName,
+          subject,
+          textBody,
+          htmlBody,
+          senderId: String(sender._id),
+          from,
+          replyTo,
+          status: "queued",
+          runAt: new Date(runAtMs),
+          createdAt: new Date(),
+        });
+
+        accepted++;
+      }
+
+      if (queueDocs.length) await emailQueue.insertMany(queueDocs, { ordered: false });
+
+      await emailBatches.updateOne(
+        { _id: batchId },
+        {
+          $inc: { accepted, rejected },
+          $set: { status: "queued", updatedAt: new Date() },
+        }
+      );
+    })().catch(async (err) => {
+      await emailBatches.updateOne(
+        { _id: batchId },
+        { $set: { status: "failed", error: String(err?.message || err), updatedAt: new Date() } }
+      );
+    });
+  } catch (e) {
+    return res.status(500).json({ error: e?.message || "failed" });
+  }
 });
 
 app.post("/api/email/senders", requireAdmin, async (req, res) => {
   const name = String(req.body?.name || "").trim();
   const email = normalizeEmail(req.body?.email);
-  const replyTo = normalizeEmail(req.body?.replyTo || "") || "";
+  const replyTo = normalizeEmail(req.body?.replyTo) || "";
   const enabled = typeof req.body?.enabled === "boolean" ? req.body.enabled : true;
-  const weight = Math.max(1, Number(req.body?.weight || 1));
+
+  // NEW signature fields (text + html)
+  const signatureText =
+  String(req.body?.signatureText || req.body?.signature || "").trim();
+
+  const signatureHtml = String(req.body?.signatureHtml || "").trim();
 
   if (!email) return res.status(400).json({ error: "invalid_email" });
 
   await emailSenders.updateOne(
     { email },
     {
-      $set: { name, email, replyTo, enabled, weight, updatedAt: new Date() },
+      $set: {
+        name,
+        email,
+        replyTo,
+        enabled,
+        signatureText,
+        signatureHtml,
+        updatedAt: new Date(),
+      },
       $setOnInsert: { createdAt: new Date() },
     },
     { upsert: true }
@@ -3017,32 +3755,28 @@ app.post("/api/email/senders", requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
+
 app.patch("/api/email/senders/:id", requireAdmin, async (req, res) => {
-  const id = String(req.params.id || "").trim();
+  const id = String(req.params.id || "");
   if (!ObjectId.isValid(id)) return res.status(400).json({ error: "invalid_id" });
 
   const update = { updatedAt: new Date() };
-  if (typeof req.body?.name === "string") update.name = req.body.name.trim();
-  if (typeof req.body?.enabled === "boolean") update.enabled = req.body.enabled;
-  if (req.body?.weight !== undefined) update.weight = Math.max(1, Number(req.body.weight || 1));
 
-  if (req.body?.email !== undefined) {
-    const email = normalizeEmail(req.body.email);
-    if (!email) return res.status(400).json({ error: "invalid_email" });
-    update.email = email;
-  }
-  if (req.body?.replyTo !== undefined) {
-    const rt = normalizeEmail(req.body.replyTo) || "";
-    update.replyTo = rt;
-  }
+  if (typeof req.body?.enabled === "boolean") update.enabled = req.body.enabled;
+  if (typeof req.body?.name === "string") update.name = req.body.name.trim();
+  if (typeof req.body?.replyTo === "string") update.replyTo = normalizeEmail(req.body.replyTo) || "";
+  if (typeof req.body?.signatureText === "string") update.signatureText = req.body.signatureText.trim();
+  if (typeof req.body?.signatureHtml === "string") update.signatureHtml = req.body.signatureHtml.trim();
 
   await emailSenders.updateOne({ _id: new ObjectId(id) }, { $set: update });
   res.json({ ok: true });
 });
 
+
 app.delete("/api/email/senders/:id", requireAdmin, async (req, res) => {
-  const id = String(req.params.id || "").trim();
+  const id = String(req.params.id || "");
   if (!ObjectId.isValid(id)) return res.status(400).json({ error: "invalid_id" });
+
   await emailSenders.deleteOne({ _id: new ObjectId(id) });
   res.json({ ok: true });
 });

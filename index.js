@@ -501,6 +501,67 @@ async function validateEmailViaMailgun(address) {
   return resp.data;
 }
 
+function parseCsvLine(line) {
+  const out = [];
+  let cur = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    const next = line[i + 1];
+
+    if (ch === '"') {
+      if (inQuotes && next === '"') {
+        cur += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+
+    if (ch === "," && !inQuotes) {
+      out.push(cur);
+      cur = "";
+      continue;
+    }
+
+    cur += ch;
+  }
+
+  out.push(cur);
+  return out.map((v) => String(v || "").trim());
+}
+
+function parseCsvText(text) {
+  const raw = String(text || "").replace(/^\uFEFF/, "");
+  const lines = raw.split(/\r?\n/).filter((x) => x.trim() !== "");
+  if (!lines.length) return [];
+
+  const headers = parseCsvLine(lines[0]).map((h) => h.trim());
+  const rows = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    const vals = parseCsvLine(lines[i]);
+    const row = {};
+    headers.forEach((h, idx) => {
+      row[h] = vals[idx] ?? "";
+    });
+    rows.push(row);
+  }
+
+  return rows;
+}
+
+function parseBooleanLoose(v, fallback = true) {
+  if (typeof v === "boolean") return v;
+  const s = String(v || "").trim().toLowerCase();
+  if (!s) return fallback;
+  if (["true", "1", "yes", "y", "enabled"].includes(s)) return true;
+  if (["false", "0", "no", "n", "disabled"].includes(s)) return false;
+  return fallback;
+}
+
 function pickValidationDecision(v) {
   const result = String(v?.result || "").toLowerCase();
   const risk = String(v?.risk || "").toLowerCase();
@@ -3577,6 +3638,84 @@ app.get("/api/email/senders", requireAdmin, async (req, res) => {
     .sort({ enabled: -1, createdAt: -1 })
     .toArray();
   res.json({ items });
+});
+
+app.post("/api/email/senders/bulk", requireAdmin, async (req, res) => {
+  try {
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    if (!rows.length) return res.status(400).json({ error: "rows_required" });
+    if (rows.length > 5000) return res.status(400).json({ error: "too_many_rows" });
+
+    let created = 0;
+    let updated = 0;
+    let rejected = 0;
+    const rejects = [];
+
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i] || {};
+
+      const name = String(r.name || r.Name || "").trim();
+      const email = normalizeEmail(r.email || r.Email || "");
+      const replyTo = normalizeEmail(r.replyTo || r["reply_to"] || r["reply-to"] || r.ReplyTo || "") || "";
+      const enabled = parseBooleanLoose(r.enabled ?? r.Enabled, true);
+      const signatureText = String(
+        r.signatureText ||
+        r.signature ||
+        r["signature_text"] ||
+        r["signature text"] ||
+        ""
+      ).trim();
+      const signatureHtml = String(
+        r.signatureHtml ||
+        r["signature_html"] ||
+        r["signature html"] ||
+        ""
+      ).trim();
+
+      if (!email) {
+        rejected++;
+        rejects.push({ index: i, email: String(r.email || r.Email || ""), reason: "invalid_email" });
+        continue;
+      }
+
+      const existing = await emailSenders.findOne(
+        { email },
+        { projection: { _id: 1 } }
+      );
+
+      await emailSenders.updateOne(
+        { email },
+        {
+          $set: {
+            name,
+            email,
+            replyTo,
+            enabled,
+            signatureText,
+            signatureHtml,
+            updatedAt: new Date(),
+          },
+          $setOnInsert: { createdAt: new Date() },
+        },
+        { upsert: true }
+      );
+
+      if (existing?._id) updated++;
+      else created++;
+    }
+
+    return res.json({
+      ok: true,
+      total: rows.length,
+      created,
+      updated,
+      rejected,
+      rejects: rejects.slice(0, 100),
+    });
+  } catch (e) {
+    console.error("bulk email senders error:", e?.message || e);
+    return res.status(500).json({ error: e?.message || "failed" });
+  }
 });
 
 app.post("/api/email/batch/append", async (req, res) => {
