@@ -1212,6 +1212,38 @@ function buildUnsubscribeUrl(baseUrl, email) {
   return `${baseUrl}/email/unsubscribe?email=${safeEmail}&token=${token}`;
 }
 
+function buildComplianceFooter(unsubscribeUrl) {
+  const privacyUrl = "https://getleads.leadlockerroom.com/privacy-policy";
+
+  const text =
+    "You are receiving this email because your business may be interested in lead generation services.\n" +
+    "We respect your privacy and do not sell your personal information. Your contact details may have been obtained through publicly available sources or trusted data providers.\n" +
+    `Unsubscribe here: ${unsubscribeUrl}\n` +
+    `Privacy Policy: ${privacyUrl}\n` +
+    "Pro Leads Marketing LLC\n" +
+    "23811 Washington Ave # C110-103\n" +
+    "Murrieta, CA 92562";
+
+  const html =
+    `<div style="margin-top:18px;font-size:12px;line-height:1.55;color:#666;border-top:1px solid #e5e7eb;padding-top:14px;">` +
+      `<div>You are receiving this email because your business may be interested in lead generation services.</div>` +
+      `<div style="margin-top:8px;">We respect your privacy and do not sell your personal information. Your contact details may have been obtained through publicly available sources or trusted data providers.</div>` +
+      `<div style="margin-top:8px;">` +
+        `Unsubscribe here: <a href="${escapeHtml(unsubscribeUrl)}">unsubscribe</a>` +
+      `</div>` +
+      `<div style="margin-top:6px;">` +
+        `Privacy Policy: <a href="https://getleads.leadlockerroom.com/privacy-policy">https://getleads.leadlockerroom.com/privacy-policy</a>` +
+      `</div>` +
+      `<div style="margin-top:10px;">` +
+        `Pro Leads Marketing LLC<br/>` +
+        `23811 Washington Ave # C110-103<br/>` +
+        `Murrieta, CA 92562` +
+      `</div>` +
+    `</div>`;
+
+  return { text, html };
+}
+
 async function isEmailOptedOut(email) {
   const normalized = normalizeEmail(email);
   if (!normalized) return true;
@@ -3680,16 +3712,7 @@ async function handleRow(i) {
         const subject = renderEmail(tpl.subject, { firstName, lastName });
         const mainText = renderEmail(tpl.body, { firstName, lastName });
         const unsubscribeUrl = buildUnsubscribeUrl(baseUrl, email);
-
-        const unsubscribeText =
-          `To unsubscribe from future emails, click here: ${unsubscribeUrl}`;
-
-        const unsubscribeHtml =
-          `<div style="margin-top:18px;font-size:12px;color:#666;">` +
-          `If you no longer want these emails, ` +
-          `<a href="${escapeHtml(unsubscribeUrl)}">unsubscribe here</a>.` +
-          `</div>`;
-
+        const footer = buildComplianceFooter(unsubscribeUrl);
         const safeFlyerUrl = String(tpl.flyerImageUrl || "").trim();
         const flyerHtml = safeFlyerUrl
           ? `<div style="margin-top:12px;"><img src="${safeFlyerUrl}" alt="Leads Locker Room" style="max-width:600px;width:100%;height:auto;border:0;" /></div>`
@@ -3726,14 +3749,14 @@ async function handleRow(i) {
         //   `${flyerHtml}` +
         //   `</div>`;
 
-        const textBody = [mainText, sigTextFinal, unsubscribeText].filter(Boolean).join("\n\n").trim();
+        const textBody = [mainText, sigTextFinal, footer.text].filter(Boolean).join("\n\n").trim();
 
         const htmlBody =
           `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.45;color:#111;">` +
           `${escapeHtmlToParagraphs(mainText)}` +
           `${sigHtmlFallback ? `<div style="margin-top:16px;">${sigHtmlFallback}</div>` : ""}` +
           `${flyerHtml}` +
-          `${unsubscribeHtml}` +
+          `${footer.html}` +
           `</div>`;
 
         const burstIndex = Math.floor(accepted / burstSizeFinal);
@@ -4111,7 +4134,8 @@ app.post("/api/email/batch/append", async (req, res) => {
 
         const subject = renderEmail(tpl.subject, { firstName, lastName });
         const mainText = renderEmail(tpl.body, { firstName, lastName });
-
+        const unsubscribeUrl = buildUnsubscribeUrl(String(batch.baseUrl || ""), email);
+        const footer = buildComplianceFooter(unsubscribeUrl);
         const sender = enabledSenders[(startSeq + i) % enabledSenders.length];
         const fromEmail = String(sender.email || "").trim();
         const fromName = String(sender.name || "").trim();
@@ -4122,13 +4146,13 @@ app.post("/api/email/batch/append", async (req, res) => {
         const sigHtmlFinal = renderEmail((sender.signatureHtml || tpl.signatureHtml || ""), { firstName, lastName });
         const sigHtmlFallback = sigHtmlFinal || textSigToHtml(sigTextFinal);
 
-        const textBody = [mainText, sigTextFinal, unsubscribeText].filter(Boolean).join("\n\n").trim();
+        const textBody = [mainText, sigTextFinal, footer.text].filter(Boolean).join("\n\n").trim();
 
         const htmlBody =
           `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.45;color:#111;">` +
           `${escapeHtmlToParagraphs(mainText)}` +
           `${sigHtmlFallback ? `<div style="margin-top:16px;">${sigHtmlFallback}</div>` : ""}` +
-          `${unsubscribeHtml}` +
+          `${footer.html}` +
           `</div>`;
         const seq = startSeq + i;
         const burstIndex = Math.floor(seq / burstSizeFinal);

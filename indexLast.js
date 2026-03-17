@@ -10,7 +10,7 @@ const notificationapi = require("notificationapi-node-server-sdk").default;
 const nodemailer = require("nodemailer");
 const multer = require("multer");
 const upload = multer();
-
+const crypto = require("crypto");
 
 
 const app = express();
@@ -53,16 +53,61 @@ const MAILGUN_BASE_URL = process.env.MAILGUN_BASE_URL || "https://api.mailgun.ne
 
 
 
-async function sendEmailViaMailgun({ from, to, subject, text, html, headers }) {
+// async function sendEmailViaMailgun({ from, to, subject, text, html, headers }) {
+//   if (!MAILGUN_API_KEY || !MAILGUN_DOMAIN) {
+//     throw new Error("mailgun_not_configured");
+//   }
+
+//   const url = `${MAILGUN_BASE_URL}/v3/${MAILGUN_DOMAIN}/messages`;
+
+//   const params = new URLSearchParams();
+
+//   // ✅ allow per-message FROM (falls back to env)
+//   const fromFinal = String(from || MAILGUN_FROM || "").trim();
+//   if (!fromFinal) throw new Error("mailgun_from_missing");
+
+//   params.append("from", fromFinal);
+//   params.append("to", to);
+//   params.append("subject", subject || "");
+//   if (text) params.append("text", text);
+//   if (html) params.append("html", html);
+
+//   // Custom headers (Mailgun uses h:Header-Name)
+//   if (headers && typeof headers === "object") {
+//     for (const [k, v] of Object.entries(headers)) {
+//       if (v) params.append(`h:${k}`, String(v));
+//     }
+//   }
+//     // ✅ extra tracing headers
+//   if (headers?.["X-LLR-Sender-Id"]) params.append("h:X-LLR-Sender-Id", String(headers["X-LLR-Sender-Id"]));
+//   if (headers?.["X-LLR-Sender-Email"]) params.append("h:X-LLR-Sender-Email", String(headers["X-LLR-Sender-Email"]));
+
+
+//   const resp = await axios.post(url, params, {
+//     auth: { username: "api", password: MAILGUN_API_KEY },
+//     timeout: 60000,
+//     headers: { "Content-Type": "application/x-www-form-urlencoded" },
+//   });
+
+//   return resp.data;
+// }
+
+async function sendEmailViaMailgun({
+  from,
+  to,
+  subject,
+  text,
+  html,
+  headers,
+  variables,
+}) {
   if (!MAILGUN_API_KEY || !MAILGUN_DOMAIN) {
     throw new Error("mailgun_not_configured");
   }
 
   const url = `${MAILGUN_BASE_URL}/v3/${MAILGUN_DOMAIN}/messages`;
-
   const params = new URLSearchParams();
 
-  // ✅ allow per-message FROM (falls back to env)
   const fromFinal = String(from || MAILGUN_FROM || "").trim();
   if (!fromFinal) throw new Error("mailgun_from_missing");
 
@@ -72,16 +117,23 @@ async function sendEmailViaMailgun({ from, to, subject, text, html, headers }) {
   if (text) params.append("text", text);
   if (html) params.append("html", html);
 
-  // Custom headers (Mailgun uses h:Header-Name)
+  // turn tracking on per-message
+  params.append("o:tracking", "yes");
+  params.append("o:tracking-opens", "yes");
+
   if (headers && typeof headers === "object") {
     for (const [k, v] of Object.entries(headers)) {
       if (v) params.append(`h:${k}`, String(v));
     }
   }
-    // ✅ extra tracing headers
-  if (headers?.["X-LLR-Sender-Id"]) params.append("h:X-LLR-Sender-Id", String(headers["X-LLR-Sender-Id"]));
-  if (headers?.["X-LLR-Sender-Email"]) params.append("h:X-LLR-Sender-Email", String(headers["X-LLR-Sender-Email"]));
 
+  if (variables && typeof variables === "object") {
+    for (const [k, v] of Object.entries(variables)) {
+      if (v !== undefined && v !== null) {
+        params.append(`v:${k}`, String(v));
+      }
+    }
+  }
 
   const resp = await axios.post(url, params, {
     auth: { username: "api", password: MAILGUN_API_KEY },
@@ -91,8 +143,6 @@ async function sendEmailViaMailgun({ from, to, subject, text, html, headers }) {
 
   return resp.data;
 }
-
-
 
 if (!NOTIF_CLIENT_ID || !NOTIF_CLIENT_SECRET) throw new Error("Missing NOTIF_CLIENT_ID / NOTIF_CLIENT_SECRET");
 if (!NOTIF_INBOUND_WEBHOOK_SECRET) throw new Error("Missing NOTIF_INBOUND_WEBHOOK_SECRET");
@@ -134,6 +184,8 @@ let emailReplyJobs;
 
 let emailSenders;
 let emailValidations;
+let emailEvents;
+let emailUnsubscribes;
 
 
 async function initDb() {
@@ -166,6 +218,8 @@ async function initDb() {
 
   emailSenders = db.collection("Email_Senders");
   emailValidations = db.collection("Email_Validations");
+  emailEvents = db.collection("Email_Events");
+  emailUnsubscribes = db.collection("Email_Unsubscribes");
 
   await emailSenders.createIndex({ email: 1 }, { unique: true });
   await emailSenders.createIndex({ enabled: 1 });
@@ -235,6 +289,14 @@ async function initDb() {
   await emailQueue.createIndex({ status: 1, sentAt: -1 });
   await emailQueue.createIndex({ status: 1, failedAt: -1 });
 
+
+  await emailEvents.createIndex({ event: 1, createdAt: -1 });
+  await emailEvents.createIndex({ recipient: 1, createdAt: -1 });
+  await emailEvents.createIndex({ queueId: 1, createdAt: -1 });
+  await emailEvents.createIndex({ messageId: 1 });
+
+  await emailUnsubscribes.createIndex({ email: 1 }, { unique: true });
+  await emailUnsubscribes.createIndex({ createdAt: -1 });
 
   // 2) TTL: auto-expire cache after 30 days
   await emailValidations.createIndex(
@@ -1128,12 +1190,61 @@ async function getOverallGoal() {
 
 
 
-  function normalizeEmail(input) {
+function normalizeEmail(input) {
   const e = String(input || "").trim().toLowerCase();
   if (!e) return null;
   // simple sanity check (good enough for 99% lists)
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) return null;
   return e;
+}
+
+
+function makeUnsubscribeToken(email) {
+  return crypto
+    .createHmac("sha256", process.env.EMAIL_INBOUND_WEBHOOK_SECRET)
+    .update(String(email || "").trim().toLowerCase())
+    .digest("hex");
+}
+
+function buildUnsubscribeUrl(baseUrl, email) {
+  const safeEmail = encodeURIComponent(String(email || "").trim().toLowerCase());
+  const token = encodeURIComponent(makeUnsubscribeToken(email));
+  return `${baseUrl}/email/unsubscribe?email=${safeEmail}&token=${token}`;
+}
+
+async function isEmailOptedOut(email) {
+  const normalized = normalizeEmail(email);
+  if (!normalized) return true;
+
+  const [sessionDoc, unsubDoc] = await Promise.all([
+    emailSessions.findOne(
+      { userId: normalizeEmailUserId(normalized) },
+      { projection: { optedOut: 1 } }
+    ),
+    emailUnsubscribes.findOne(
+      { email: normalized },
+      { projection: { _id: 1 } }
+    ),
+  ]);
+
+  return !!(sessionDoc?.optedOut || unsubDoc?._id);
+}
+
+async function addMailgunUnsubscribe(email) {
+  const normalized = normalizeEmail(email);
+  if (!normalized) return;
+
+  const url = `${MAILGUN_BASE_URL}/v3/${MAILGUN_DOMAIN}/unsubscribes`;
+
+  await axios.post(
+    url,
+    new URLSearchParams({ address: normalized }),
+    {
+      auth: { username: "api", password: MAILGUN_API_KEY },
+      timeout: 30000,
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    }
+  );
 }
 
 function renderEmail(template, vars) {
@@ -1232,7 +1343,21 @@ async function processOneEmailJob() {
     // choose ONE sender (pick your path)
     // await sendEmailViaSendGrid({ to: job.email, subject: job.subject, text: job.body });
     // await sendEmailViaSMTP({ to: job.email, subject: job.subject, text: job.body });
-await sendEmailViaMailgun({
+    if (await isEmailOptedOut(job.email)) {
+  await emailQueue.updateOne(
+    { _id: job._id },
+    { $set: { status: "skipped_unsubscribed", skippedAt: new Date() } }
+  );
+
+  await emailBatches.updateOne(
+    { _id: job.batchId },
+    { $inc: { skipped: 1 }, $set: { updatedAt: new Date() } }
+  );
+
+  return true;
+}
+
+const mgResp = await sendEmailViaMailgun({
   from: job.from,
   to: job.email,
   subject: job.subject,
@@ -1240,18 +1365,34 @@ await sendEmailViaMailgun({
   html: job.htmlBody || undefined,
   headers: {
     ...(job.replyTo ? { "Reply-To": job.replyTo } : {}),
+    ...(job.unsubscribeUrl
+      ? {
+          "List-Unsubscribe": `<${job.unsubscribeUrl}>`,
+          "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+        }
+      : {}),
     "X-LLR-Sender-Id": job.senderId || "",
     "X-LLR-Sender-Email": (String(job.from || "").match(/<([^>]+)>/)?.[1] || job.from || ""),
+  },
+  variables: {
+    llr_queue_id: String(job._id),
+    llr_batch_id: String(job.batchId || ""),
+    llr_email: String(job.email || ""),
   },
 });
 
 
-
-
-    await emailQueue.updateOne(
-      { _id: job._id },
-      { $set: { status: "sent", sentAt: new Date() } }
-    );
+  await emailQueue.updateOne(
+  { _id: job._id },
+  {
+    $set: {
+      status: "sent",
+      sentAt: new Date(),
+      provider: "mailgun",
+      providerMessageId: String(mgResp?.id || ""),
+    }
+  }
+);
 
     await emailBatches.updateOne(
       { _id: job.batchId },
@@ -2286,6 +2427,152 @@ app.post("/api/outbound/batch", requireAdmin, async (req, res) => {
   }
 });
 
+app.get("/email/unsubscribe", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.query.email);
+    const token = String(req.query.token || "").trim();
+
+    if (!email || !token) {
+      return res.status(400).send("Invalid unsubscribe link.");
+    }
+
+    const expected = makeUnsubscribeToken(email);
+    if (token !== expected) {
+      return res.status(401).send("Invalid unsubscribe token.");
+    }
+
+    await emailSessions.updateOne(
+      { userId: normalizeEmailUserId(email) },
+      {
+        $setOnInsert: { userId: normalizeEmailUserId(email), createdAt: new Date() },
+        $set: {
+          email,
+          optedOut: true,
+          optedOutAt: new Date(),
+          updatedAt: new Date(),
+        },
+      },
+      { upsert: true }
+    );
+
+    await emailUnsubscribes.updateOne(
+      { email },
+      {
+        $set: {
+          email,
+          source: "local_link",
+          updatedAt: new Date(),
+        },
+        $setOnInsert: {
+          createdAt: new Date(),
+        },
+      },
+      { upsert: true }
+    );
+
+    try {
+      await addMailgunUnsubscribe(email);
+    } catch (e) {
+      console.error("mailgun unsubscribe sync error:", e?.response?.data || e?.message || e);
+    }
+
+    return res
+      .status(200)
+      .send(`<html><body style="font-family:Arial,sans-serif;padding:24px;">You have been unsubscribed.</body></html>`);
+  } catch (e) {
+    console.error("unsubscribe page error:", e?.message || e);
+    return res.status(500).send("Something went wrong.");
+  }
+});
+
+app.post("/webhook/mailgun/events", express.json({ limit: "2mb" }), async (req, res) => {
+  try {
+    if (req.query.token !== process.env.EMAIL_INBOUND_WEBHOOK_SECRET) {
+      return res.status(401).send("unauthorized");
+    }
+
+    const payload = req.body?.["event-data"] || req.body || {};
+    const event = String(payload?.event || "").trim();
+    const recipient = normalizeEmail(payload?.recipient || "");
+    const userVars = payload?.["user-variables"] || {};
+    const queueId = String(userVars?.llr_queue_id || "").trim();
+    const batchId = String(userVars?.llr_batch_id || "").trim();
+    const messageId = String(payload?.message?.headers?.["message-id"] || "").trim();
+    const eventAt = payload?.timestamp ? new Date(Number(payload.timestamp) * 1000) : new Date();
+
+    await emailEvents.insertOne({
+      provider: "mailgun",
+      event,
+      recipient,
+      queueId,
+      batchId,
+      messageId,
+      payload,
+      createdAt: eventAt,
+      receivedAt: new Date(),
+    });
+
+    if (queueId && ObjectId.isValid(queueId)) {
+      const qid = new ObjectId(queueId);
+
+      if (event === "opened") {
+        await emailQueue.updateOne(
+          { _id: qid },
+          {
+            $set: { openedAt: eventAt, openTracked: true },
+            $inc: { openCount: 1 },
+          }
+        );
+      }
+
+      if (event === "unsubscribed") {
+        await emailQueue.updateOne(
+          { _id: qid },
+          {
+            $set: { unsubscribedAt: eventAt, unsubscribedTracked: true },
+          }
+        );
+      }
+    }
+
+    if (event === "unsubscribed" && recipient) {
+      await emailSessions.updateOne(
+        { userId: normalizeEmailUserId(recipient) },
+        {
+          $setOnInsert: { userId: normalizeEmailUserId(recipient), createdAt: new Date() },
+          $set: {
+            email: recipient,
+            optedOut: true,
+            optedOutAt: eventAt,
+            updatedAt: new Date(),
+          },
+        },
+        { upsert: true }
+      );
+
+      await emailUnsubscribes.updateOne(
+        { email: recipient },
+        {
+          $set: {
+            email: recipient,
+            source: "mailgun_webhook",
+            updatedAt: new Date(),
+          },
+          $setOnInsert: {
+            createdAt: eventAt,
+          },
+        },
+        { upsert: true }
+      );
+    }
+
+    return res.status(200).json({ ok: true });
+  } catch (e) {
+    console.error("mailgun events webhook error:", e?.message || e);
+    return res.status(200).json({ ok: false });
+  }
+});
+
 app.get("/api/escalation/events", async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit || 200), 500);
@@ -3283,6 +3570,9 @@ app.post("/api/email/batch", async (req, res) => {
 
     const batchId = new ObjectId().toString();
     const now = Date.now();
+    const proto = (req.headers["x-forwarded-proto"] || req.protocol || "https").split(",")[0].trim();
+    const host = (req.headers["x-forwarded-host"] || req.get("host") || "").split(",")[0].trim();
+    const baseUrl = `${proto}://${host}`;
 
     // ✅ Create batch immediately with "validating" state
     await emailBatches.insertOne({
@@ -3304,6 +3594,7 @@ app.post("/api/email/batch", async (req, res) => {
       updatedAt: new Date(),
       startAtMs: now,
       nextSeq: 0,
+      baseUrl,
     });
 
     // ✅ Respond immediately so frontend never "Failed to fetch"
@@ -3336,10 +3627,15 @@ app.post("/api/email/batch", async (req, res) => {
       const CONCURRENCY = 8; // tune: 4-12 is usually fine
       let idx = 0;
 
-      async function handleRow(i) {
+async function handleRow(i) {
         const r = rows[i] || {};
         const emailRaw = r.email || r.Email || "";
         const email = normalizeEmail(emailRaw);
+        if (await isEmailOptedOut(email)) {
+        rejected++;
+        rejects.push({ index: i, email, reason: "opted_out" });
+        return;
+      }
 
         if (!email) {
           rejected++;
@@ -3383,6 +3679,16 @@ app.post("/api/email/batch", async (req, res) => {
 
         const subject = renderEmail(tpl.subject, { firstName, lastName });
         const mainText = renderEmail(tpl.body, { firstName, lastName });
+        const unsubscribeUrl = buildUnsubscribeUrl(baseUrl, email);
+
+        const unsubscribeText =
+          `To unsubscribe from future emails, click here: ${unsubscribeUrl}`;
+
+        const unsubscribeHtml =
+          `<div style="margin-top:18px;font-size:12px;color:#666;">` +
+          `If you no longer want these emails, ` +
+          `<a href="${escapeHtml(unsubscribeUrl)}">unsubscribe here</a>.` +
+          `</div>`;
 
         const safeFlyerUrl = String(tpl.flyerImageUrl || "").trim();
         const flyerHtml = safeFlyerUrl
@@ -3411,13 +3717,23 @@ app.post("/api/email/batch", async (req, res) => {
 
         const sigHtmlFallback = sigHtmlFinal || textSigToHtml(sigTextFinal);
 
-        const textBody = [mainText, sigTextFinal].filter(Boolean).join("\n\n").trim();
+        // const textBody = [mainText, sigTextFinal].filter(Boolean).join("\n\n").trim();
+
+        // const htmlBody =
+        //   `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.45;color:#111;">` +
+        //   `${escapeHtmlToParagraphs(mainText)}` +
+        //   `${sigHtmlFallback ? `<div style="margin-top:16px;">${sigHtmlFallback}</div>` : ""}` +
+        //   `${flyerHtml}` +
+        //   `</div>`;
+
+        const textBody = [mainText, sigTextFinal, unsubscribeText].filter(Boolean).join("\n\n").trim();
 
         const htmlBody =
           `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.45;color:#111;">` +
           `${escapeHtmlToParagraphs(mainText)}` +
           `${sigHtmlFallback ? `<div style="margin-top:16px;">${sigHtmlFallback}</div>` : ""}` +
           `${flyerHtml}` +
+          `${unsubscribeHtml}` +
           `</div>`;
 
         const burstIndex = Math.floor(accepted / burstSizeFinal);
@@ -3447,6 +3763,7 @@ app.post("/api/email/batch", async (req, res) => {
           status: "queued",
           runAt,
           createdAt: new Date(),
+          unsubscribeUrl,
         });
 
         accepted++;
@@ -3773,6 +4090,10 @@ app.post("/api/email/batch/append", async (req, res) => {
         const r = rows[i] || {};
         const emailRaw = r.email || r.Email || "";
         const email = normalizeEmail(emailRaw);
+        if (await isEmailOptedOut(email)) {
+          rejected++;
+          continue;
+        }
         if (!email) { rejected++; continue; }
 
         // enforce daily cap based on "sent plan size" if you want strict caps
@@ -3801,14 +4122,14 @@ app.post("/api/email/batch/append", async (req, res) => {
         const sigHtmlFinal = renderEmail((sender.signatureHtml || tpl.signatureHtml || ""), { firstName, lastName });
         const sigHtmlFallback = sigHtmlFinal || textSigToHtml(sigTextFinal);
 
-        const textBody = [mainText, sigTextFinal].filter(Boolean).join("\n\n").trim();
+        const textBody = [mainText, sigTextFinal, unsubscribeText].filter(Boolean).join("\n\n").trim();
 
         const htmlBody =
           `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.45;color:#111;">` +
           `${escapeHtmlToParagraphs(mainText)}` +
           `${sigHtmlFallback ? `<div style="margin-top:16px;">${sigHtmlFallback}</div>` : ""}` +
+          `${unsubscribeHtml}` +
           `</div>`;
-
         const seq = startSeq + i;
         const burstIndex = Math.floor(seq / burstSizeFinal);
         const offsetInBurst = seq % burstSizeFinal;
@@ -3835,6 +4156,7 @@ app.post("/api/email/batch/append", async (req, res) => {
           status: "queued",
           runAt: new Date(runAtMs),
           createdAt: new Date(),
+          unsubscribeUrl,
         });
 
         accepted++;
