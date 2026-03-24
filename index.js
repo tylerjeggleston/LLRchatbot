@@ -1486,7 +1486,13 @@ async function processOneEmailJob() {
   return true;
 }
 
+const domainConfig = await getEmailDomainById(job.domainId);
+if (!domainConfig) {
+  throw new Error("job_domain_missing_or_disabled");
+}
+
 const mgResp = await sendEmailViaMailgun({
+  domainConfig,
   from: job.from,
   to: job.email,
   subject: job.subject,
@@ -1507,6 +1513,7 @@ const mgResp = await sendEmailViaMailgun({
     llr_queue_id: String(job._id),
     llr_batch_id: String(job.batchId || ""),
     llr_email: String(job.email || ""),
+    llr_domain_id: String(job.domainId || ""),
   },
 });
 
