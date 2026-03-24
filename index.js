@@ -172,7 +172,7 @@ async function sendEmailViaMailgun({
 
   const mailgunDomain = String(domainConfig.domain || "").trim();
   const mailgunBaseUrl = String(domainConfig.mailgunBaseUrl || "https://api.mailgun.net").trim();
-  const mailgunApiKey = decryptSecret(domainConfig.apiKeyEnc || "");
+  const mailgunApiKey = process.env.MAILGUN_API_KEY || "";
 
   if (!mailgunDomain || !mailgunApiKey) {
     throw new Error("mailgun_domain_not_configured");
@@ -4381,8 +4381,8 @@ app.get("/api/email/domains", requireAdmin, async (req, res) => {
     res.json({
       items: items.map((d) => ({
         ...d,
-        apiKeyMasked: d.apiKeyEnc ? maskSecret(decryptSecret(d.apiKeyEnc)) : "",
-        apiKeyEnc: undefined, // never expose encrypted blob either
+        apiKeyMasked: "",
+        apiKeyEnc: undefined,
       })),
     });
   } catch (e) {
