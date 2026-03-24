@@ -102,9 +102,10 @@ async function sendEmailViaMailgun({
   headers,
   variables,
 }) {
-  const apiKey = String(domainConfig?.apiKey || MAILGUN_API_KEY || "").trim();
+  // API key always comes from server env — never from DB or frontend
+  const apiKey = String(MAILGUN_API_KEY || "").trim();
   const domain = String(domainConfig?.domain || MAILGUN_DOMAIN || "").trim();
-  const baseUrl = String(domainConfig?.baseUrl || MAILGUN_BASE_URL || "https://api.mailgun.net").trim();
+  const baseUrl = String(MAILGUN_BASE_URL || "https://api.mailgun.net").trim();
 
   if (!apiKey || !domain) {
     throw new Error("mailgun_not_configured");
