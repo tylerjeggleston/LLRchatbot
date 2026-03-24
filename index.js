@@ -4014,6 +4014,74 @@ app.get("/api/email/reply-jobs", requireAdmin, async (req, res) => {
   res.json({ items });
 });
 
+// ─── Email Domains ───────────────────────────────────────────────────────────
+// API key is NEVER stored in DB or returned to the frontend.
+// Domains only carry: domain, label, fromEmail, fromName, isDefault, enabled.
+
+app.get("/api/email/domains", requireAdmin, async (req, res) => {
+  const items = await emailDomains
+    .find({}, { projection: { apiKey: 0 } })
+    .sort({ isDefault: -1, createdAt: 1 })
+    .toArray();
+  res.json({ items });
+});
+
+app.post("/api/email/domains", requireAdmin, async (req, res) => {
+  const domain = String(req.body?.domain || "").trim().toLowerCase();
+  if (!domain) return res.status(400).json({ error: "domain_required" });
+
+  const label      = String(req.body?.label     || "").trim();
+  const fromEmail  = String(req.body?.fromEmail || "").trim().toLowerCase();
+  const fromName   = String(req.body?.fromName  || "").trim();
+  const isDefault  = typeof req.body?.isDefault === "boolean" ? req.body.isDefault : false;
+  const enabled    = typeof req.body?.enabled   === "boolean" ? req.body.enabled   : true;
+
+  if (isDefault) {
+    await emailDomains.updateMany({}, { $set: { isDefault: false } });
+  }
+
+  await emailDomains.updateOne(
+    { domain },
+    {
+      $set: { label, fromEmail, fromName, isDefault, enabled, updatedAt: new Date() },
+      $setOnInsert: { domain, createdAt: new Date() },
+    },
+    { upsert: true }
+  );
+
+  res.json({ ok: true });
+});
+
+app.patch("/api/email/domains/:id", requireAdmin, async (req, res) => {
+  const id = String(req.params.id || "");
+  if (!ObjectId.isValid(id)) return res.status(400).json({ error: "invalid_id" });
+
+  const update = { updatedAt: new Date() };
+  if (typeof req.body?.label     === "string")  update.label     = req.body.label.trim();
+  if (typeof req.body?.fromEmail === "string")  update.fromEmail = req.body.fromEmail.trim().toLowerCase();
+  if (typeof req.body?.fromName  === "string")  update.fromName  = req.body.fromName.trim();
+  if (typeof req.body?.enabled   === "boolean") update.enabled   = req.body.enabled;
+  if (typeof req.body?.isDefault === "boolean") {
+    if (req.body.isDefault) {
+      await emailDomains.updateMany({}, { $set: { isDefault: false } });
+    }
+    update.isDefault = req.body.isDefault;
+  }
+
+  await emailDomains.updateOne({ _id: new ObjectId(id) }, { $set: update });
+  res.json({ ok: true });
+});
+
+app.delete("/api/email/domains/:id", requireAdmin, async (req, res) => {
+  const id = String(req.params.id || "");
+  if (!ObjectId.isValid(id)) return res.status(400).json({ error: "invalid_id" });
+
+  await emailDomains.deleteOne({ _id: new ObjectId(id) });
+  res.json({ ok: true });
+});
+
+// ─── Email Senders ───────────────────────────────────────────────────────────
+
 app.get("/api/email/senders", requireAdmin, async (req, res) => {
   const items = await emailSenders
     .find({})
