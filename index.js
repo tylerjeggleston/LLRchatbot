@@ -12,6 +12,57 @@ const multer = require("multer");
 const upload = multer();
 const crypto = require("crypto");
 
+const CONFIG_SECRET = process.env.CONFIG_SECRET || "";
+
+function getConfigKey() {
+  return crypto.createHash("sha256").update(String(CONFIG_SECRET)).digest();
+}
+
+function encryptSecret(plain) {
+  const text = String(plain || "");
+  if (!text) return "";
+  if (!CONFIG_SECRET) throw new Error("Missing CONFIG_SECRET");
+
+  const iv = crypto.randomBytes(12);
+  const key = getConfigKey();
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+
+  const enc = Buffer.concat([cipher.update(text, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+
+  return [
+    iv.toString("base64"),
+    tag.toString("base64"),
+    enc.toString("base64"),
+  ].join(".");
+}
+
+function decryptSecret(payload) {
+  const raw = String(payload || "");
+  if (!raw) return "";
+  if (!CONFIG_SECRET) throw new Error("Missing CONFIG_SECRET");
+
+  const [ivB64, tagB64, encB64] = raw.split(".");
+  if (!ivB64 || !tagB64 || !encB64) throw new Error("invalid_encrypted_secret");
+
+  const iv = Buffer.from(ivB64, "base64");
+  const tag = Buffer.from(tagB64, "base64");
+  const enc = Buffer.from(encB64, "base64");
+
+  const key = getConfigKey();
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(tag);
+
+  const dec = Buffer.concat([decipher.update(enc), decipher.final()]);
+  return dec.toString("utf8");
+}
+
+function maskSecret(v) {
+  const s = String(v || "");
+  if (!s) return "";
+  if (s.length <= 8) return "********";
+  return `${s.slice(0, 4)}********${s.slice(-4)}`;
+}
 
 const app = express();
 
@@ -53,16 +104,24 @@ const MAILGUN_BASE_URL = process.env.MAILGUN_BASE_URL || "https://api.mailgun.ne
 
 
 
-// async function sendEmailViaMailgun({ from, to, subject, text, html, headers }) {
+
+
+// async function sendEmailViaMailgun({
+//   from,
+//   to,
+//   subject,
+//   text,
+//   html,
+//   headers,
+//   variables,
+// }) {
 //   if (!MAILGUN_API_KEY || !MAILGUN_DOMAIN) {
 //     throw new Error("mailgun_not_configured");
 //   }
 
 //   const url = `${MAILGUN_BASE_URL}/v3/${MAILGUN_DOMAIN}/messages`;
-
 //   const params = new URLSearchParams();
 
-//   // ✅ allow per-message FROM (falls back to env)
 //   const fromFinal = String(from || MAILGUN_FROM || "").trim();
 //   if (!fromFinal) throw new Error("mailgun_from_missing");
 
@@ -72,16 +131,23 @@ const MAILGUN_BASE_URL = process.env.MAILGUN_BASE_URL || "https://api.mailgun.ne
 //   if (text) params.append("text", text);
 //   if (html) params.append("html", html);
 
-//   // Custom headers (Mailgun uses h:Header-Name)
+//   // turn tracking on per-message
+//   params.append("o:tracking", "yes");
+//   params.append("o:tracking-opens", "yes");
+
 //   if (headers && typeof headers === "object") {
 //     for (const [k, v] of Object.entries(headers)) {
 //       if (v) params.append(`h:${k}`, String(v));
 //     }
 //   }
-//     // ✅ extra tracing headers
-//   if (headers?.["X-LLR-Sender-Id"]) params.append("h:X-LLR-Sender-Id", String(headers["X-LLR-Sender-Id"]));
-//   if (headers?.["X-LLR-Sender-Email"]) params.append("h:X-LLR-Sender-Email", String(headers["X-LLR-Sender-Email"]));
 
+//   if (variables && typeof variables === "object") {
+//     for (const [k, v] of Object.entries(variables)) {
+//       if (v !== undefined && v !== null) {
+//         params.append(`v:${k}`, String(v));
+//       }
+//     }
+//   }
 
 //   const resp = await axios.post(url, params, {
 //     auth: { username: "api", password: MAILGUN_API_KEY },
@@ -93,6 +159,7 @@ const MAILGUN_BASE_URL = process.env.MAILGUN_BASE_URL || "https://api.mailgun.ne
 // }
 
 async function sendEmailViaMailgun({
+  domainConfig,
   from,
   to,
   subject,
@@ -101,14 +168,20 @@ async function sendEmailViaMailgun({
   headers,
   variables,
 }) {
-  if (!MAILGUN_API_KEY || !MAILGUN_DOMAIN) {
-    throw new Error("mailgun_not_configured");
+  if (!domainConfig) throw new Error("mailgun_domain_config_missing");
+
+  const mailgunDomain = String(domainConfig.domain || "").trim();
+  const mailgunBaseUrl = String(domainConfig.mailgunBaseUrl || "https://api.mailgun.net").trim();
+  const mailgunApiKey = decryptSecret(domainConfig.apiKeyEnc || "");
+
+  if (!mailgunDomain || !mailgunApiKey) {
+    throw new Error("mailgun_domain_not_configured");
   }
 
-  const url = `${MAILGUN_BASE_URL}/v3/${MAILGUN_DOMAIN}/messages`;
+  const url = `${mailgunBaseUrl}/v3/${mailgunDomain}/messages`;
   const params = new URLSearchParams();
 
-  const fromFinal = String(from || MAILGUN_FROM || "").trim();
+  const fromFinal = String(from || "").trim();
   if (!fromFinal) throw new Error("mailgun_from_missing");
 
   params.append("from", fromFinal);
@@ -117,7 +190,6 @@ async function sendEmailViaMailgun({
   if (text) params.append("text", text);
   if (html) params.append("html", html);
 
-  // turn tracking on per-message
   params.append("o:tracking", "yes");
   params.append("o:tracking-opens", "yes");
 
@@ -136,7 +208,7 @@ async function sendEmailViaMailgun({
   }
 
   const resp = await axios.post(url, params, {
-    auth: { username: "api", password: MAILGUN_API_KEY },
+    auth: { username: "api", password: mailgunApiKey },
     timeout: 60000,
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
   });
@@ -186,7 +258,7 @@ let emailSenders;
 let emailValidations;
 let emailEvents;
 let emailUnsubscribes;
-
+let emailDomains;
 
 async function initDb() {
   await mongo.connect();
@@ -220,6 +292,12 @@ async function initDb() {
   emailValidations = db.collection("Email_Validations");
   emailEvents = db.collection("Email_Events");
   emailUnsubscribes = db.collection("Email_Unsubscribes");
+
+  emailDomains = db.collection("Email_Domains");
+
+  await emailDomains.createIndex({ domain: 1 }, { unique: true });
+  await emailDomains.createIndex({ enabled: 1 });
+  await emailDomains.createIndex({ isDefault: 1 });
 
   await emailSenders.createIndex({ email: 1 }, { unique: true });
   await emailSenders.createIndex({ enabled: 1 });
@@ -348,6 +426,26 @@ function escapeHtml(s) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
+}
+
+async function getDefaultEmailDomain() {
+  let doc = await emailDomains.findOne({ enabled: true, isDefault: true });
+  if (doc) return doc;
+
+  doc = await emailDomains.findOne({ enabled: true }, { sort: { createdAt: 1 } });
+  return doc || null;
+}
+
+async function getEmailDomainById(id) {
+  if (!ObjectId.isValid(id)) return null;
+  return emailDomains.findOne({ _id: new ObjectId(id), enabled: true });
+}
+
+function buildFromValue(fromName, fromEmail) {
+  const name = String(fromName || "").trim();
+  const email = String(fromEmail || "").trim();
+  if (!email) return "";
+  return name ? `${name} <${email}>` : email;
 }
 
 function escapeHtmlToParagraphs(text) {
@@ -3720,9 +3818,16 @@ async function handleRow(i) {
         // ✅ pick sender
         const sender = singleSender || enabledSenders[accepted % enabledSenders.length];
 
-        const fromEmail = String(sender.email || "").trim();
-        const fromName = String(sender.name || "").trim();
-        const from = fromName ? `${fromName} <${fromEmail}>` : fromEmail;
+        const domainDoc = await getEmailDomainById(sender.domainId);
+        if (!domainDoc) {
+          rejected++;
+          rejects.push({ index: i, email, reason: "sender_domain_missing_or_disabled" });
+          return;
+        }
+
+        const fromEmail = String(sender.email || domainDoc.fromEmail || "").trim();
+        const fromName = String(sender.name || domainDoc.fromName || "").trim();
+        const from = buildFromValue(fromName, fromEmail);
 
         const replyTo = String(sender.replyTo || "").trim();
 
@@ -3780,6 +3885,7 @@ async function handleRow(i) {
           textBody,
           htmlBody,
           senderId: String(sender._id),
+          domainId: String(domainDoc._id),
           from,
           replyTo,
           status: "queued",
@@ -4210,14 +4316,14 @@ app.post("/api/email/senders", requireAdmin, async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   const replyTo = normalizeEmail(req.body?.replyTo) || "";
   const enabled = typeof req.body?.enabled === "boolean" ? req.body.enabled : true;
-
-  // NEW signature fields (text + html)
-  const signatureText =
-  String(req.body?.signatureText || req.body?.signature || "").trim();
-
+  const signatureText = String(req.body?.signatureText || req.body?.signature || "").trim();
   const signatureHtml = String(req.body?.signatureHtml || "").trim();
+  const domainId = String(req.body?.domainId || "").trim();
 
   if (!email) return res.status(400).json({ error: "invalid_email" });
+  if (!domainId || !ObjectId.isValid(domainId)) {
+    return res.status(400).json({ error: "valid_domainId_required" });
+  }
 
   await emailSenders.updateOne(
     { email },
@@ -4229,6 +4335,7 @@ app.post("/api/email/senders", requireAdmin, async (req, res) => {
         enabled,
         signatureText,
         signatureHtml,
+        domainId,
         updatedAt: new Date(),
       },
       $setOnInsert: { createdAt: new Date() },
@@ -4263,6 +4370,120 @@ app.delete("/api/email/senders/:id", requireAdmin, async (req, res) => {
 
   await emailSenders.deleteOne({ _id: new ObjectId(id) });
   res.json({ ok: true });
+});
+
+app.get("/api/email/domains", requireAdmin, async (req, res) => {
+  try {
+    const items = await emailDomains.find({})
+      .sort({ isDefault: -1, enabled: -1, createdAt: -1 })
+      .toArray();
+
+    res.json({
+      items: items.map((d) => ({
+        ...d,
+        apiKeyMasked: d.apiKeyEnc ? maskSecret(decryptSecret(d.apiKeyEnc)) : "",
+        apiKeyEnc: undefined, // never expose encrypted blob either
+      })),
+    });
+  } catch (e) {
+    console.error("GET /api/email/domains error:", e?.message || e);
+    res.status(500).json({ error: "failed_to_load_domains" });
+  }
+});
+
+app.post("/api/email/domains", requireAdmin, async (req, res) => {
+  try {
+    const label = String(req.body?.label || "").trim();
+    const provider = "mailgun";
+    const domain = String(req.body?.domain || "").trim().toLowerCase();
+    const fromEmail = normalizeEmail(req.body?.fromEmail);
+    const fromName = String(req.body?.fromName || "").trim();
+    const emailFrom = normalizeEmail(req.body?.emailFrom) || "";
+    const smtpUser = normalizeEmail(req.body?.smtpUser) || "";
+    const mailgunBaseUrl = String(req.body?.mailgunBaseUrl || "https://api.mailgun.net").trim();
+    const mailgunApiKey = String(req.body?.mailgunApiKey || "").trim();
+    const enabled = typeof req.body?.enabled === "boolean" ? req.body.enabled : true;
+    const isDefault = !!req.body?.isDefault;
+
+    if (!domain) return res.status(400).json({ error: "domain_required" });
+    if (!fromEmail) return res.status(400).json({ error: "fromEmail_required" });
+    if (!mailgunApiKey) return res.status(400).json({ error: "mailgunApiKey_required" });
+
+    if (isDefault) {
+      await emailDomains.updateMany({}, { $set: { isDefault: false, updatedAt: new Date() } });
+    }
+
+    await emailDomains.insertOne({
+      label,
+      provider,
+      domain,
+      fromEmail,
+      fromName,
+      emailFrom,
+      smtpUser,
+      mailgunBaseUrl,
+      apiKeyEnc: encryptSecret(mailgunApiKey),
+      enabled,
+      isDefault,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("POST /api/email/domains error:", e?.message || e);
+    res.status(500).json({ error: e?.message || "failed_to_create_domain" });
+  }
+});
+
+app.patch("/api/email/domains/:id", requireAdmin, async (req, res) => {
+  try {
+    const id = String(req.params.id || "");
+    if (!ObjectId.isValid(id)) return res.status(400).json({ error: "invalid_id" });
+
+    const update = { updatedAt: new Date() };
+
+    if (typeof req.body?.label === "string") update.label = req.body.label.trim();
+    if (typeof req.body?.domain === "string") update.domain = req.body.domain.trim().toLowerCase();
+    if (typeof req.body?.fromName === "string") update.fromName = req.body.fromName.trim();
+    if (typeof req.body?.fromEmail === "string") update.fromEmail = normalizeEmail(req.body.fromEmail);
+    if (typeof req.body?.emailFrom === "string") update.emailFrom = normalizeEmail(req.body.emailFrom) || "";
+    if (typeof req.body?.smtpUser === "string") update.smtpUser = normalizeEmail(req.body.smtpUser) || "";
+    if (typeof req.body?.mailgunBaseUrl === "string") update.mailgunBaseUrl = req.body.mailgunBaseUrl.trim();
+    if (typeof req.body?.enabled === "boolean") update.enabled = req.body.enabled;
+
+    if (typeof req.body?.mailgunApiKey === "string" && req.body.mailgunApiKey.trim()) {
+      update.apiKeyEnc = encryptSecret(req.body.mailgunApiKey.trim());
+    }
+
+    if (typeof req.body?.isDefault === "boolean" && req.body.isDefault) {
+      await emailDomains.updateMany({}, { $set: { isDefault: false, updatedAt: new Date() } });
+      update.isDefault = true;
+    }
+
+    await emailDomains.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: update }
+    );
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("PATCH /api/email/domains/:id error:", e?.message || e);
+    res.status(500).json({ error: e?.message || "failed_to_update_domain" });
+  }
+});
+
+app.delete("/api/email/domains/:id", requireAdmin, async (req, res) => {
+  try {
+    const id = String(req.params.id || "");
+    if (!ObjectId.isValid(id)) return res.status(400).json({ error: "invalid_id" });
+
+    await emailDomains.deleteOne({ _id: new ObjectId(id) });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("DELETE /api/email/domains/:id error:", e?.message || e);
+    res.status(500).json({ error: "failed_to_delete_domain" });
+  }
 });
 
 
