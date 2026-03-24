@@ -580,9 +580,15 @@ if (!sender) {
   sender = await emailSenders.findOne({ enabled: true }, { sort: { createdAt: 1 } });
 }
 
-const fromEmail = String(sender?.email || "").trim();
-const fromName = String(sender?.name || "").trim();
-const from = fromName ? `${fromName} <${fromEmail}>` : fromEmail;
+const domainDoc = sender?.domainId
+  ? await getEmailDomainById(sender.domainId)
+  : await getDefaultEmailDomain();
+
+if (!domainDoc) throw new Error("reply_domain_missing");
+
+const fromEmail = String(sender?.email || domainDoc?.fromEmail || "").trim();
+const fromName = String(sender?.name || domainDoc?.fromName || "").trim();
+const from = buildFromValue(fromName, fromEmail);
 
 const replyTo = String(sender?.replyTo || "").trim();
 
@@ -606,6 +612,7 @@ const finalHtml =
 
     // ✅ 5) send via Mailgun using SAME sender
     await sendEmailViaMailgun({
+    domainConfig: domainDoc,
     from,
     to: job.toEmail,
     subject: job.subject?.toLowerCase().startsWith("re:") ? job.subject : `Re: ${job.subject || "Quick question"}`,
@@ -4287,6 +4294,7 @@ app.post("/api/email/batch/append", async (req, res) => {
           textBody,
           htmlBody,
           senderId: String(sender._id),
+          domainId: String(sender.domainId || ""),
           from,
           replyTo,
           status: "queued",
