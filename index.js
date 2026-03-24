@@ -4394,71 +4394,100 @@ app.get("/api/email/domains", requireAdmin, async (req, res) => {
 app.post("/api/email/domains", requireAdmin, async (req, res) => {
   try {
     const label = String(req.body?.label || "").trim();
-    const provider = "mailgun";
     const domain = String(req.body?.domain || "").trim().toLowerCase();
-    const fromEmail = normalizeEmail(req.body?.fromEmail);
     const fromName = String(req.body?.fromName || "").trim();
-    const emailFrom = normalizeEmail(req.body?.emailFrom) || "";
-    const smtpUser = normalizeEmail(req.body?.smtpUser) || "";
+    const fromEmail = normalizeEmail(req.body?.fromEmail);
+    const emailFrom = normalizeEmail(req.body?.emailFrom) || fromEmail || "";
+    const smtpUser = normalizeEmail(req.body?.smtpUser) || fromEmail || "";
     const mailgunBaseUrl = String(req.body?.mailgunBaseUrl || "https://api.mailgun.net").trim();
-    const mailgunApiKey = String(req.body?.mailgunApiKey || "").trim();
     const enabled = typeof req.body?.enabled === "boolean" ? req.body.enabled : true;
     const isDefault = !!req.body?.isDefault;
 
+    if (!label) return res.status(400).json({ error: "label_required" });
     if (!domain) return res.status(400).json({ error: "domain_required" });
     if (!fromEmail) return res.status(400).json({ error: "fromEmail_required" });
-    if (!mailgunApiKey) return res.status(400).json({ error: "mailgunApiKey_required" });
 
     if (isDefault) {
       await emailDomains.updateMany({}, { $set: { isDefault: false, updatedAt: new Date() } });
     }
 
-    await emailDomains.insertOne({
+    const doc = {
       label,
-      provider,
       domain,
-      fromEmail,
       fromName,
+      fromEmail,
       emailFrom,
       smtpUser,
       mailgunBaseUrl,
-      apiKeyEnc: encryptSecret(mailgunApiKey),
       enabled,
       isDefault,
-      createdAt: new Date(),
       updatedAt: new Date(),
-    });
+    };
 
-    res.json({ ok: true });
+    await emailDomains.updateOne(
+      { domain },
+      {
+        $set: doc,
+        $setOnInsert: { createdAt: new Date() },
+      },
+      { upsert: true }
+    );
+
+    return res.json({ ok: true });
   } catch (e) {
     console.error("POST /api/email/domains error:", e?.message || e);
-    res.status(500).json({ error: e?.message || "failed_to_create_domain" });
+    return res.status(500).json({ error: e?.message || "failed" });
   }
 });
 
 app.patch("/api/email/domains/:id", requireAdmin, async (req, res) => {
   try {
     const id = String(req.params.id || "");
-    if (!ObjectId.isValid(id)) return res.status(400).json({ error: "invalid_id" });
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "invalid_id" });
+    }
 
     const update = { updatedAt: new Date() };
 
-    if (typeof req.body?.label === "string") update.label = req.body.label.trim();
-    if (typeof req.body?.domain === "string") update.domain = req.body.domain.trim().toLowerCase();
-    if (typeof req.body?.fromName === "string") update.fromName = req.body.fromName.trim();
-    if (typeof req.body?.fromEmail === "string") update.fromEmail = normalizeEmail(req.body.fromEmail);
-    if (typeof req.body?.emailFrom === "string") update.emailFrom = normalizeEmail(req.body.emailFrom) || "";
-    if (typeof req.body?.smtpUser === "string") update.smtpUser = normalizeEmail(req.body.smtpUser) || "";
-    if (typeof req.body?.mailgunBaseUrl === "string") update.mailgunBaseUrl = req.body.mailgunBaseUrl.trim();
-    if (typeof req.body?.enabled === "boolean") update.enabled = req.body.enabled;
-
-    if (typeof req.body?.mailgunApiKey === "string" && req.body.mailgunApiKey.trim()) {
-      update.apiKeyEnc = encryptSecret(req.body.mailgunApiKey.trim());
+    if (typeof req.body?.label === "string") {
+      update.label = req.body.label.trim();
     }
 
-    if (typeof req.body?.isDefault === "boolean" && req.body.isDefault) {
-      await emailDomains.updateMany({}, { $set: { isDefault: false, updatedAt: new Date() } });
-      update.isDefault = true;
+    if (typeof req.body?.domain === "string") {
+      update.domain = req.body.domain.trim().toLowerCase();
+    }
+
+    if (typeof req.body?.fromName === "string") {
+      update.fromName = req.body.fromName.trim();
+    }
+
+    if (typeof req.body?.fromEmail === "string") {
+      const v = normalizeEmail(req.body.fromEmail);
+      if (!v) return res.status(400).json({ error: "invalid_fromEmail" });
+      update.fromEmail = v;
+    }
+
+    if (typeof req.body?.emailFrom === "string") {
+      update.emailFrom = normalizeEmail(req.body.emailFrom) || "";
+    }
+
+    if (typeof req.body?.smtpUser === "string") {
+      update.smtpUser = normalizeEmail(req.body.smtpUser) || "";
+    }
+
+    if (typeof req.body?.mailgunBaseUrl === "string") {
+      update.mailgunBaseUrl = req.body.mailgunBaseUrl.trim() || "https://api.mailgun.net";
+    }
+
+    if (typeof req.body?.enabled === "boolean") {
+      update.enabled = req.body.enabled;
+    }
+
+    if (typeof req.body?.isDefault === "boolean") {
+      if (req.body.isDefault) {
+        await emailDomains.updateMany({}, { $set: { isDefault: false, updatedAt: new Date() } });
+      }
+      update.isDefault = req.body.isDefault;
     }
 
     await emailDomains.updateOne(
@@ -4466,10 +4495,10 @@ app.patch("/api/email/domains/:id", requireAdmin, async (req, res) => {
       { $set: update }
     );
 
-    res.json({ ok: true });
+    return res.json({ ok: true });
   } catch (e) {
     console.error("PATCH /api/email/domains/:id error:", e?.message || e);
-    res.status(500).json({ error: e?.message || "failed_to_update_domain" });
+    return res.status(500).json({ error: e?.message || "failed" });
   }
 });
 
