@@ -93,6 +93,7 @@ const MAILGUN_BASE_URL = process.env.MAILGUN_BASE_URL || "https://api.mailgun.ne
 // }
 
 async function sendEmailViaMailgun({
+  domainConfig,
   from,
   to,
   subject,
@@ -101,14 +102,18 @@ async function sendEmailViaMailgun({
   headers,
   variables,
 }) {
-  if (!MAILGUN_API_KEY || !MAILGUN_DOMAIN) {
+  const apiKey = String(domainConfig?.apiKey || MAILGUN_API_KEY || "").trim();
+  const domain = String(domainConfig?.domain || MAILGUN_DOMAIN || "").trim();
+  const baseUrl = String(domainConfig?.baseUrl || MAILGUN_BASE_URL || "https://api.mailgun.net").trim();
+
+  if (!apiKey || !domain) {
     throw new Error("mailgun_not_configured");
   }
 
-  const url = `${MAILGUN_BASE_URL}/v3/${MAILGUN_DOMAIN}/messages`;
+  const url = `${baseUrl}/v3/${domain}/messages`;
   const params = new URLSearchParams();
 
-  const fromFinal = String(from || MAILGUN_FROM || "").trim();
+  const fromFinal = String(from || domainConfig?.fromEmail || MAILGUN_FROM || "").trim();
   if (!fromFinal) throw new Error("mailgun_from_missing");
 
   params.append("from", fromFinal);
@@ -136,7 +141,7 @@ async function sendEmailViaMailgun({
   }
 
   const resp = await axios.post(url, params, {
-    auth: { username: "api", password: MAILGUN_API_KEY },
+    auth: { username: "api", password: apiKey },
     timeout: 60000,
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
   });
@@ -186,6 +191,7 @@ let emailSenders;
 let emailValidations;
 let emailEvents;
 let emailUnsubscribes;
+let emailDomains;
 
 
 async function initDb() {
@@ -220,6 +226,7 @@ async function initDb() {
   emailValidations = db.collection("Email_Validations");
   emailEvents = db.collection("Email_Events");
   emailUnsubscribes = db.collection("Email_Unsubscribes");
+  emailDomains = db.collection("Email_Domains");
 
   await emailSenders.createIndex({ email: 1 }, { unique: true });
   await emailSenders.createIndex({ enabled: 1 });
@@ -297,6 +304,9 @@ async function initDb() {
 
   await emailUnsubscribes.createIndex({ email: 1 }, { unique: true });
   await emailUnsubscribes.createIndex({ createdAt: -1 });
+
+  await emailDomains.createIndex({ domain: 1 }, { unique: true });
+  await emailDomains.createIndex({ enabled: 1 });
 
   // 2) TTL: auto-expire cache after 30 days
   await emailValidations.createIndex(
@@ -426,6 +436,24 @@ Rules:
   return resp.data?.choices?.[0]?.message?.content?.trim() || "";
 }
 
+function buildFromValue(name, email) {
+  const n = String(name || "").trim();
+  const e = String(email || "").trim();
+  return n ? `${n} <${e}>` : e;
+}
+
+async function getEmailDomainById(domainId) {
+  if (!domainId) return null;
+  const id = ObjectId.isValid(String(domainId)) ? new ObjectId(String(domainId)) : null;
+  if (!id) return null;
+  const doc = await emailDomains.findOne({ _id: id, enabled: true });
+  return doc || null;
+}
+
+async function getDefaultEmailDomain() {
+  return emailDomains.findOne({ enabled: true }, { sort: { createdAt: 1 } });
+}
+
 async function processOneEmailReplyJob() {
   const now = new Date();
 
@@ -482,9 +510,15 @@ if (!sender) {
   sender = await emailSenders.findOne({ enabled: true }, { sort: { createdAt: 1 } });
 }
 
-const fromEmail = String(sender?.email || "").trim();
-const fromName = String(sender?.name || "").trim();
-const from = fromName ? `${fromName} <${fromEmail}>` : fromEmail;
+const domainDoc = sender?.domainId
+  ? await getEmailDomainById(sender.domainId)
+  : await getDefaultEmailDomain();
+
+if (!domainDoc) throw new Error("reply_domain_missing");
+
+const fromEmail = String(sender?.email || domainDoc?.fromEmail || "").trim();
+const fromName = String(sender?.name || domainDoc?.fromName || "").trim();
+const from = buildFromValue(fromName, fromEmail);
 
 const replyTo = String(sender?.replyTo || "").trim();
 
@@ -508,6 +542,7 @@ const finalHtml =
 
     // ✅ 5) send via Mailgun using SAME sender
     await sendEmailViaMailgun({
+    domainConfig: domainDoc,
     from,
     to: job.toEmail,
     subject: job.subject?.toLowerCase().startsWith("re:") ? job.subject : `Re: ${job.subject || "Quick question"}`,
@@ -1388,7 +1423,13 @@ async function processOneEmailJob() {
   return true;
 }
 
+const domainConfig = await getEmailDomainById(job.domainId);
+if (!domainConfig) {
+  throw new Error("job_domain_missing_or_disabled");
+}
+
 const mgResp = await sendEmailViaMailgun({
+  domainConfig,
   from: job.from,
   to: job.email,
   subject: job.subject,
@@ -1409,6 +1450,7 @@ const mgResp = await sendEmailViaMailgun({
     llr_queue_id: String(job._id),
     llr_batch_id: String(job.batchId || ""),
     llr_email: String(job.email || ""),
+    llr_domain_id: String(job.domainId || ""),
   },
 });
 
