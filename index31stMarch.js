@@ -729,28 +729,25 @@ function parseBooleanLoose(v, fallback = true) {
   return fallback;
 }
 
-function pickValidationDecision(v, opts = {}) {
+function pickValidationDecision(v) {
   const result = String(v?.result || "").toLowerCase();
   const risk = String(v?.risk || "").toLowerCase();
 
-  // ── Hard blocks only ────────────────────────────────────────────────────────
-  // Disposable addresses (10minutemail etc.) — guaranteed bounces / spam traps
+  // hard blocks for cold outbound
   if (v?.is_disposable_address) return { ok: false, action: "reject_disposable" };
+  if (v?.is_role_address) return { ok: false, action: "reject_role" };
 
-  // Mailgun explicitly marks as do-not-send / undeliverable → hard bounce
-  if (result === "undeliverable" || result === "do_not_send") {
-    return { ok: false, action: "reject_undeliverable" };
-  }
+  // reputation killers / guaranteed pain
+  if (result === "undeliverable" || result === "do_not_send") return { ok: false, action: "reject" };
 
-  // High risk → likely spam trap or invalid
+  // don't send when risk is high even if "deliverable"
   if (risk === "high") return { ok: false, action: "skip_high_risk" };
 
-  // ── Everything else → send ──────────────────────────────────────────────────
-  // catch_all:  domain accepts all addresses (Gmail, Yahoo, most corps do this)
-  // unknown:    provider won't disclose — low/medium risk is fine for outreach
-  // deliverable: confirmed good
-  // is_role_address: info@, admin@ etc. — legitimate cold outreach targets
-  return { ok: true, action: "send" };
+  // safe-ish
+  if (result === "deliverable" && (risk === "low" || risk === "medium")) return { ok: true, action: "send" };
+
+  // catch_all / unknown -> skip by default
+  return { ok: false, action: "skip_risky" };
 }
 
 function getZonedParts(date, tz) {
@@ -812,25 +809,37 @@ function startOfTodayInTZ(tz = "America/Los_Angeles") {
 }
 
 
-async function getEmailValidationCached(email, opts = {}) {
+async function getEmailValidationCached(email) {
   const address = normalizeEmail(email);
   if (!address) return { ok: false, reason: "invalid_email" };
 
+  // cache hit?
   const cached = await emailValidations.findOne({ address });
   if (cached?.payload) {
-    const decision = pickValidationDecision(cached.payload, opts);
+    const decision = pickValidationDecision(cached.payload);
     return { ok: decision.ok, decision, payload: cached.payload, cached: true };
   }
 
+  // cache miss -> call Mailgun
   const payload = await validateEmailViaMailgun(address);
 
+  // store
   await emailValidations.updateOne(
     { address },
-    { $set: { address, validatedAt: new Date(), payload, result: payload?.result || "", risk: payload?.risk || "", reason: payload?.reason || [] } },
+    {
+      $set: {
+        address,
+        validatedAt: new Date(),
+        payload,
+        result: payload?.result || "",
+        risk: payload?.risk || "",
+        reason: payload?.reason || [],
+      },
+    },
     { upsert: true }
   );
 
-  const decision = pickValidationDecision(payload, opts);
+  const decision = pickValidationDecision(payload);
   return { ok: decision.ok, decision, payload, cached: false };
 }
 
@@ -1286,25 +1295,14 @@ async function getOverallGoal() {
 
 
 
-// function normalizeEmail(input) {
-//   const e = String(input || "").trim().toLowerCase();
-//   if (!e) return null;
-//   // simple sanity check (good enough for 99% lists)
-//   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) return null;
-//   return e;
-// }
-const HIDDEN_CHARS_RE = /[\u200B-\u200D\u2060\uFEFF]/g; // zero-width chars
 function normalizeEmail(input) {
-  const e = String(input || "")
-    .replace(HIDDEN_CHARS_RE, "")
-    .replace(/\u00A0/g, " ") // NBSP
-    .trim()
-    .toLowerCase();
-
+  const e = String(input || "").trim().toLowerCase();
   if (!e) return null;
+  // simple sanity check (good enough for 99% lists)
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) return null;
   return e;
 }
+
 
 function makeUnsubscribeToken(email) {
   return crypto
@@ -3694,11 +3692,6 @@ app.post("/api/email/batch", async (req, res) => {
 
     const tpl = await getEmailBlastTemplate();
     if (!tpl.enabled) return res.status(409).json({ error: "email_template_disabled" });
-    const skipValidation = !!req.body?.skipValidation;
-    const decisionOpts = {
-      allowCatchAll: skipValidation || !!req.body?.allowCatchAll,
-      allowUnknownLowRisk: skipValidation || !!req.body?.allowUnknownLowRisk,
-    };
 
     // ✅ fetch enabled senders ONCE
     const enabledSenders = await emailSenders
@@ -3796,29 +3789,32 @@ async function handleRow(i) {
         // stop if daily cap hit
         if (accepted >= dailyCap) return;
 
-        // ✅ Mailgun deliverability validation BEFORE enqueue (skipped when skipValidation=true)
-        if (!skipValidation) {
-          let v;
-          try {
-            v = await getEmailValidationCached(email, decisionOpts);
-          } catch (e) {
-            // validation API error → fail open, log and continue sending
-            console.warn("validation_error (fail open):", email, e?.message || e);
-            v = { ok: true };
-          }
+        // ✅ Mailgun deliverability validation BEFORE enqueue (same as your old behavior)
+        let v;
+        try {
+          v = await getEmailValidationCached(email);
+        } catch (e) {
+          rejected++;
+          rejects.push({
+            index: i,
+            email,
+            reason: "validation_error",
+            detail: e?.message || String(e),
+          });
+          return;
+        }
 
-          if (!v?.ok) {
-            rejected++;
-            rejects.push({
-              index: i,
-              email,
-              reason: `not_sendable:${String(v?.payload?.result || "unknown")}`,
-              risk: String(v?.payload?.risk || ""),
-              why: Array.isArray(v?.payload?.reason) ? v.payload.reason : [],
-              action: v?.decision?.action || "skip",
-            });
-            return;
-          }
+        if (!v?.ok) {
+          rejected++;
+          rejects.push({
+            index: i,
+            email,
+            reason: `not_sendable:${String(v?.payload?.result || "unknown")}`,
+            risk: String(v?.payload?.risk || ""),
+            why: Array.isArray(v?.payload?.reason) ? v.payload.reason : [],
+            action: v?.decision?.action || "skip",
+          });
+          return;
         }
 
         const firstName = String(r.firstName || r.firstname || "").trim();
@@ -4247,11 +4243,8 @@ app.post("/api/email/batch/append", async (req, res) => {
         if ((batch.accepted || 0) + accepted >= dailyCap) break;
 
         let v;
-        try { v = await getEmailValidationCached(email, { allowCatchAll: true, allowUnknownLowRisk: true }); }
-        catch (e) {
-          console.warn("append validation_error (fail open):", email, e?.message || e);
-          v = { ok: true }; // fail open on API errors
-        }
+        try { v = await getEmailValidationCached(email); }
+        catch { rejected++; continue; }
 
         if (!v?.ok) { rejected++; continue; }
 
@@ -4263,11 +4256,9 @@ app.post("/api/email/batch/append", async (req, res) => {
         const unsubscribeUrl = buildUnsubscribeUrl(String(batch.baseUrl || ""), email);
         const footer = buildComplianceFooter(unsubscribeUrl);
         const sender = enabledSenders[(startSeq + i) % enabledSenders.length];
-        const senderDomainDoc = sender.domainId ? await getEmailDomainById(sender.domainId) : await getDefaultEmailDomain();
-        if (!senderDomainDoc) { rejected++; continue; }
-        const fromEmail = String(sender.email || senderDomainDoc.fromEmail || "").trim();
-        const fromName = String(sender.name || senderDomainDoc.fromName || "").trim();
-        const from = buildFromValue(fromName, fromEmail);
+        const fromEmail = String(sender.email || "").trim();
+        const fromName = String(sender.name || "").trim();
+        const from = fromName ? `${fromName} <${fromEmail}>` : fromEmail;
         const replyTo = String(sender.replyTo || "").trim();
 
         const sigTextFinal = renderEmail((sender.signatureText || sender.signature || tpl.signatureText || ""), { firstName, lastName });
@@ -4303,7 +4294,7 @@ app.post("/api/email/batch/append", async (req, res) => {
           textBody,
           htmlBody,
           senderId: String(sender._id),
-          domainId: String(senderDomainDoc._id),
+          domainId: String(sender.domainId || ""),
           from,
           replyTo,
           status: "queued",
@@ -4382,11 +4373,6 @@ app.patch("/api/email/senders/:id", requireAdmin, async (req, res) => {
   if (typeof req.body?.replyTo === "string") update.replyTo = normalizeEmail(req.body.replyTo) || "";
   if (typeof req.body?.signatureText === "string") update.signatureText = req.body.signatureText.trim();
   if (typeof req.body?.signatureHtml === "string") update.signatureHtml = req.body.signatureHtml.trim();
-  if (typeof req.body?.domainId === "string") {
-    const did = req.body.domainId.trim();
-    if (did && !ObjectId.isValid(did)) return res.status(400).json({ error: "invalid_domainId" });
-    update.domainId = did || null;
-  }
 
   await emailSenders.updateOne({ _id: new ObjectId(id) }, { $set: update });
   res.json({ ok: true });
