@@ -366,9 +366,6 @@ async function initDb() {
   await emailValidations.createIndex({ address: 1 }, { unique: true });
   await emailQueue.createIndex({ status: 1, sentAt: -1 });
   await emailQueue.createIndex({ status: 1, failedAt: -1 });
-  // 24h duplicate guard indexes
-  await emailQueue.createIndex({ email: 1, status: 1, sentAt: -1 });
-  await outboundQueue.createIndex({ number: 1, status: 1, sentAt: -1 });
 
 
   await emailEvents.createIndex({ event: 1, createdAt: -1 });
@@ -1489,30 +1486,12 @@ async function processOneEmailJob() {
     { _id: job._id },
     { $set: { status: "skipped_unsubscribed", skippedAt: new Date() } }
   );
-  await emailBatches.updateOne(
-    { _id: job.batchId },
-    { $inc: { skipped: 1 }, $set: { updatedAt: new Date() } }
-  );
-  return true;
-}
 
-// ✅ 24-hour duplicate guard — skip if already sent to this email today
-const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000);
-const recentSend = await emailQueue.findOne({
-  email: job.email,
-  status: "sent",
-  sentAt: { $gte: since24h },
-  _id: { $ne: job._id },
-});
-if (recentSend) {
-  await emailQueue.updateOne(
-    { _id: job._id },
-    { $set: { status: "skipped_24h", skippedAt: new Date(), skipReason: "already_sent_within_24h" } }
-  );
   await emailBatches.updateOne(
     { _id: job.batchId },
     { $inc: { skipped: 1 }, $set: { updatedAt: new Date() } }
   );
+
   return true;
 }
 
@@ -2891,34 +2870,6 @@ if (sess?.optedOut) {
   return true; // job consumed
 }
 
-// ✅ 24-hour duplicate guard — skip if already sent SMS to this number today
-const smsSince24h = new Date(Date.now() - 24 * 60 * 60 * 1000);
-const recentSmsSend = await outboundQueue.findOne({
-  number: job.number,
-  status: "sent",
-  sentAt: { $gte: smsSince24h },
-  _id: { $ne: job._id },
-});
-if (recentSmsSend) {
-  await outboundQueue.updateOne(
-    { _id: job._id },
-    { $set: { status: "skipped_24h", skippedAt: new Date(), skipReason: "already_sent_within_24h" } }
-  );
-  if (job.batchId) {
-    await outboundBatches.updateOne(
-      { _id: job.batchId },
-      { $inc: { skipped: 1 }, $set: { updatedAt: new Date() } }
-    );
-    const b = await outboundBatches.findOne({ _id: job.batchId });
-    if (b && (b.sent + b.failed + (b.skipped || 0)) >= b.accepted) {
-      await outboundBatches.updateOne(
-        { _id: job.batchId },
-        { $set: { status: "done", updatedAt: new Date() } }
-      );
-    }
-  }
-  return true;
-}
 
   try {
     // Create session + save first message
